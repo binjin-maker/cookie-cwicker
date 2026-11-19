@@ -108,7 +108,8 @@ CONTENTS
   the cookie it points at the store card it's saving for (with
   arrows if that card is scrolled off screen).
 
-  Plus a green box around whatever it's reading at that moment, a
+  Plus a green box around whatever it's reading at that moment (with
+  a scan line sweeping down it), a
   blue vignette around the screen edges and a spinning ring
   around the cursor that bursts on each click (bigger burst for bonus
   cookies). All of it is click-through and excluded from the bot's
@@ -430,11 +431,12 @@ CONTENTS
 
   POPUPS / CAPTCHA (main.cpp)
   - Captcha phrases: screenState() cap[] list.
-  - Baker puzzle: screenGuard(), "530" = click count, "done % 24 == 23"
+  - Baker puzzle: screenGuard(), "530" = click count, "done % 12 == 11"
     = how often it re-checks whether the puzzle is gone.
   - Popup phrases: screenState() pop[] list.
   - Buttons it may press on popups: dismissPopup() ok[] list.
   - Beep interval while waiting: screenGuard(): "now() - lastBeep > 30".
+  - Re-check while waiting on a captcha: screenGuard(): "Sleep(1000)".
 
   SAFETY
   - Never-click words: updateDanger() bad[] list. Add words to block
@@ -546,7 +548,8 @@ CONTENTS
   buying it as soon as it shows up.
     buy 10 grandmas / save up for a dough portal / get 2 bakeries
         -> becomes its goal. It saves up and buys only that until
-           done, then goes back to normal play. Works for research
+           it has bought that many (counted per successful buy),
+           then goes back to normal play. Works for research
            too. Number words (one..twenty) work.
     cancel / nevermind          drop the current order
     skip bakery / don't buy X   never buy that ("allow X" undoes it)

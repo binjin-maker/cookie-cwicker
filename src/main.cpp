@@ -31,7 +31,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 6;
+static const int VERSION = 7;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -51,8 +51,10 @@ static std::string gPromptText, gReply;
 static std::atomic<bool> gPromptOpen{false};
 static double gPromptLast = 0, gReplyAt = -100;
 static std::deque<std::string> gCmds;
-struct Goal { bool on = false; std::string key, name; int target = 0, start = 0; double since = 0; };
+struct Goal { bool on = false; std::string key, name; int target = 0, start = 0, count = 1, bought = 0; double since = 0; };
 static Goal gGoal;
+static void updateGoalHud();
+static void processCmds();
 
 static double now() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return (double)c.QuadPart / gFreq.QuadPart; }
 
@@ -124,7 +126,10 @@ struct Burst { int x, y; double t; bool big; };
 static std::mutex gFxMu;
 static std::vector<Burst> gBursts;
 static const int FXS = 260;
-static HWND gPath = nullptr, gRead = nullptr;
+static HWND gPath = nullptr, gRead = nullptr, gScan = nullptr, gDead = nullptr;
+static std::atomic<bool> gPuzzle{false};
+static std::atomic<int> gPuzzleHits{0};
+static int gPuzzleX = 0, gPuzzleY = 0;
 static Rect gReadRect{0, 0, 0, 0};
 static double gReadAt = -100;
 static std::atomic<bool> gCapturing{false};
@@ -242,9 +247,19 @@ static void overlayThread() {
     loadHudPos();
     bool hudGrab = false;
     gPath = makeOverlay(L"CookieBotFx", e4);
-    bool e5 = false;
+    bool e5 = false, e6 = false, e7 = false;
     gRead = makeOverlay(L"CookieBotFx", e5);
-    gHiddenFromCapture = e1 && e2 && e3 && e4 && e5;
+    gScan = makeOverlay(L"CookieBotFx", e6);
+    gDead = makeOverlay(L"CookieBotFx", e7);
+    gHiddenFromCapture = e1 && e2 && e3 && e4 && e5 && e6 && e7;
+    bool scanShown = false, deadShown = false;
+    std::vector<uint32_t> sbuf, dbuf;
+    int scanW = 0;
+    struct Shard { float x, y, vx, vy, life, age; int r, g, b; };
+    std::vector<Shard> shards;
+    int lastHits = 0;
+    double lastFrame = now(), shakeUntil = 0;
+    std::vector<std::vector<std::pair<float, float>>> cracks;
     bool readShown = false;
     Rect readDrawn{0, 0, 0, 0};
     std::vector<uint32_t> rbuf;
@@ -264,7 +279,7 @@ static void overlayThread() {
             if (on) {
                 if (memcmp(&lastMon, &gMon, sizeof(RECT)) != 0) { renderVignette(gMon); lastMon = gMon; }
                 ShowWindow(gVig, SW_SHOWNOACTIVATE); ShowWindow(gFx, SW_SHOWNOACTIVATE);
-            } else { ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gPath, SW_HIDE); pathShown = false; ShowWindow(gRead, SW_HIDE); readShown = false; }
+            } else { ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gPath, SW_HIDE); pathShown = false; ShowWindow(gRead, SW_HIDE); readShown = false; ShowWindow(gScan, SW_HIDE); scanShown = false; scanW = 0; ShowWindow(gDead, SW_HIDE); deadShown = false; }
             shown = on; gVigVisible = on;
         }
         bool hudOn = (cfgFx || gPromptOpen) && gHwnd && gameFocused() && !gQuit;
@@ -385,12 +400,127 @@ static void overlayThread() {
                 }
                 if (!readShown) { ShowWindow(gRead, SW_SHOWNOACTIVATE); readShown = true; }
             } else if (readShown) { ShowWindow(gRead, SW_HIDE); readShown = false; }
+
+            // scanning sweep inside the read box
+            if (readShown && rr.y1 - rr.y0 > 30) {
+                int w = rr.x1 - rr.x0, sh = 26;
+                if (w != scanW) {
+                    scanW = w;
+                    sbuf.assign((size_t)w * sh, 0);
+                    for (int y = 0; y < sh; y++) {
+                        float k = 1 - std::fabs(y - sh * 0.75f) / (sh * 0.75f);
+                        if (y > sh * 0.75f) k = 1 - (y - sh * 0.75f) / (sh * 0.25f);
+                        k = std::max(0.f, k); k = k * k;
+                        for (int x = 0; x < w; x++) {
+                            float edge = std::min(1.f, std::min(x, w - 1 - x) / 30.f);
+                            float a = k * edge * (y >= sh - 3 ? 1.f : 0.45f);
+                            sbuf[(size_t)y * w + x] = ((uint32_t)(a * 255) << 24) | ((uint32_t)(a * 120) << 16) | ((uint32_t)(a * 255) << 8) | (uint32_t)(a * 150);
+                        }
+                    }
+                    pushLayered(gScan, rr.x0, rr.y0, w, sh, sbuf.data());
+                }
+                float ph = (float)std::fmod((now() - rat) * 1.6, 1.0);
+                int sy = rr.y0 + (int)((rr.y1 - rr.y0 - sh) * ph);
+                SetWindowPos(gScan, HWND_TOPMOST, rr.x0, sy, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+                if (!scanShown) { ShowWindow(gScan, SW_SHOWNOACTIVATE); scanShown = true; }
+            } else if (scanShown) { ShowWindow(gScan, SW_HIDE); scanShown = false; scanW = 0; }
+
+            // deadeye on the baker puzzle
+            double dt = now() - lastFrame; lastFrame = now();
+            if (gPuzzle && !gCapturing) {
+                const int D = 600; const float C = D / 2.f;
+                int hits = gPuzzleHits;
+                float prog = std::min(1.f, hits / 530.f);
+                if (hits < lastHits || cracks.empty()) {
+                    cracks.clear();
+                    for (int i = 0; i < 9; i++) {
+                        std::vector<std::pair<float, float>> c;
+                        float ang = i * 0.698f + (rand() % 100) / 200.f, x = 0, y = 0;
+                        for (int j = 0; j < 14; j++) {
+                            ang += ((rand() % 100) - 50) / 160.f;
+                            x += std::cos(ang) * 18; y += std::sin(ang) * 18;
+                            c.push_back({x, y});
+                        }
+                        cracks.push_back(c);
+                    }
+                    lastHits = 0;
+                }
+                for (int h = lastHits; h < hits; h++) {
+                    for (int i = 0; i < 7; i++) {
+                        float a = (rand() % 628) / 100.f, sp = 160 + rand() % 260;
+                        int pick = rand() % 3;
+                        shards.push_back({0, 0, std::cos(a) * sp, std::sin(a) * sp - 80, 0.5f + (rand() % 40) / 100.f, 0,
+                                          255, pick == 0 ? 60 : pick == 1 ? 140 : 210, pick == 2 ? 120 : 30});
+                    }
+                    shakeUntil = now() + 0.07;
+                }
+                lastHits = hits;
+                if (shards.size() > 500) shards.erase(shards.begin(), shards.begin() + (shards.size() - 500));
+                dbuf.assign((size_t)D * D, 0);
+                Canvas dc{D, D, dbuf.data()};
+                float tt = (float)(now() - t0);
+                // red tint disc
+                dc.disc(C, C, 250, 120, 0, 0, 0.10f + 0.06f * prog, 60);
+                // cracks grow with progress
+                for (auto &c : cracks) {
+                    int n = (int)(c.size() * std::min(1.f, prog * 1.6f + 0.05f));
+                    for (int j = 0; j < n; j++) {
+                        float px = C + c[j].first, py = C + c[j].second;
+                        float qx = j ? C + c[j - 1].first : C, qy = j ? C + c[j - 1].second : C;
+                        for (int s2 = 0; s2 <= 6; s2++) {
+                            float u = s2 / 6.f;
+                            dc.disc(qx + (px - qx) * u, qy + (py - qy) * u, 2.2f - j * 0.1f, 255, 70, 50, 0.85f);
+                        }
+                    }
+                }
+                // outer segmented ring, spinning
+                for (int i = 0; i < 48; i++) {
+                    if (i % 4 == 3) continue;
+                    float a = tt * 0.9f + i * 6.2832f / 48;
+                    dc.disc(C + std::cos(a) * 250, C + std::sin(a) * 250, 4.5f, 30, 0, 0, 0.7f);
+                    dc.disc(C + std::cos(a) * 250, C + std::sin(a) * 250, 3.2f, 255, 45, 45, 1.f);
+                }
+                // progress arc
+                int segs2 = (int)(160 * prog);
+                for (int i = 0; i < segs2; i++) {
+                    float a = -1.5708f + i * 6.2832f / 160;
+                    dc.disc(C + std::cos(a) * 222, C + std::sin(a) * 222, 6.f, 255, 210, 60, 0.95f);
+                }
+                // inner rings
+                float pulse = 1 + 0.08f * std::sin(tt * 14);
+                dc.ring(C, C, 150 * pulse, 6, 30, 0, 0, 0.7f);
+                dc.ring(C, C, 150 * pulse, 4, 255, 40, 40, 1.f);
+                dc.ring(C, C, 70, 3, 255, 90, 90, 0.9f);
+                // crosshair arms with a gap, counter-spinning ticks
+                for (int arm = 0; arm < 4; arm++) {
+                    float a = arm * 1.5708f;
+                    for (float r = 45; r < 290; r += 2.5f) {
+                        if (r > 155 && r < 205) continue;
+                        float x = C + std::cos(a) * r, y = C + std::sin(a) * r;
+                        dc.disc(x, y, 4.2f, 30, 0, 0, 0.6f);
+                        dc.disc(x, y, 2.8f, 255, 50, 50, 1.f);
+                    }
+                    float b = -tt * 2.2f + arm * 1.5708f + 0.785f;
+                    for (float r = 100; r < 130; r += 2.5f) dc.disc(C + std::cos(b) * r, C + std::sin(b) * r, 3.f, 255, 120, 120, 0.95f);
+                }
+                dc.disc(C, C, 7 + 2 * std::sin(tt * 20), 255, 230, 230, 1.f);
+                // shards
+                for (auto &sd : shards) {
+                    sd.age += (float)dt; sd.x += sd.vx * (float)dt; sd.y += sd.vy * (float)dt; sd.vy += 520 * (float)dt;
+                    float k = 1 - sd.age / sd.life;
+                    if (k > 0) dc.disc(C + sd.x, C + sd.y, 1.5f + 3 * k, sd.r, sd.g, sd.b, k);
+                }
+                shards.erase(std::remove_if(shards.begin(), shards.end(), [](const Shard &a) { return a.age > a.life; }), shards.end());
+                int jx = now() < shakeUntil ? (rand() % 9) - 4 : 0, jy = now() < shakeUntil ? (rand() % 9) - 4 : 0;
+                pushLayered(gDead, gPuzzleX - D / 2 + jx, gPuzzleY - D / 2 + jy, D, D, dbuf.data());
+                if (!deadShown) { ShowWindow(gDead, SW_SHOWNOACTIVATE); deadShown = true; }
+            } else if (deadShown) { ShowWindow(gDead, SW_HIDE); deadShown = false; shards.clear(); cracks.clear(); lastHits = 0; }
             { std::lock_guard<std::mutex> lk(gFxMu);
               gBursts.erase(std::remove_if(gBursts.begin(), gBursts.end(), [](const Burst &b) { return now() - b.t > 1; }), gBursts.end()); }
         }
         Sleep(16);
     }
-    ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gHudWnd, SW_HIDE); ShowWindow(gPath, SW_HIDE); ShowWindow(gRead, SW_HIDE);
+    ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gHudWnd, SW_HIDE); ShowWindow(gPath, SW_HIDE); ShowWindow(gRead, SW_HIDE); ShowWindow(gScan, SW_HIDE); ShowWindow(gDead, SW_HIDE);
 }
 
 // ================= input =================
@@ -560,7 +690,7 @@ static Img grab(const Rect &r, double scale, bool smooth) {
     if (sw <= 0 || sh <= 0) return im;
     bool hide = !gHiddenFromCapture && (gVigVisible || IsWindowVisible(gHudWnd));
     bool hudWas = hide && IsWindowVisible(gHudWnd), vigWas = hide && gVigVisible;
-    if (hide) { gCapturing = true; ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gHudWnd, SW_HIDE); ShowWindow(gPath, SW_HIDE); ShowWindow(gRead, SW_HIDE); Sleep(40); }
+    if (hide) { gCapturing = true; ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gHudWnd, SW_HIDE); ShowWindow(gPath, SW_HIDE); ShowWindow(gRead, SW_HIDE); ShowWindow(gScan, SW_HIDE); ShowWindow(gDead, SW_HIDE); Sleep(40); }
     im.w = std::max(1, (int)(sw * scale)); im.h = std::max(1, (int)(sh * scale));
     HDC scr = GetDC(nullptr), mem = CreateCompatibleDC(scr);
     BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -1061,6 +1191,8 @@ static void screenGuard() {
         else {
             logf("baker puzzle - clicking screen center 530 times");
             setState("PUZZLE");
+            gPuzzleX = x; gPuzzleY = y; gPuzzleHits = 0; gPuzzle = true;
+            struct Off { ~Off() { gPuzzle = false; } } puzzleOff;
             int done = 0;
             bool gone = false;
             if (glideTo(x, y)) {
@@ -1069,10 +1201,10 @@ static void screenGuard() {
                     while (gLastClick + gap - now() > 0) Sleep(1);
                     if (!canAct()) break;
                     sendMouse(x, y, MOUSEEVENTF_LEFTDOWN); sendMouse(x, y, MOUSEEVENTF_LEFTUP);
-                    gLastClick = now(); fxClick(x, y);
+                    gLastClick = now(); fxClick(x, y, true); gPuzzleHits++;
                     { std::lock_guard<std::mutex> lk(gHud.mu); gHud.clicks++; }
                     if (done % 10 == 0) setTask("Baker puzzle: %d / 530 clicks", done);
-                    if (done % 24 == 23 && screenState(segs) != 3) { done++; gone = true; break; }
+                    if (done % 12 == 11 && screenState(segs) != 3) { done++; gone = true; break; }
                 }
             }
             logf(gone ? "baker puzzle gone after %d clicks - stopping" : "baker puzzle: %d clicks done", done);
@@ -1091,7 +1223,7 @@ static void screenGuard() {
     MessageBeep(MB_ICONEXCLAMATION);
     double lastBeep = now();
     while (!gQuit && !gPaused) {
-        Sleep(2000);
+        Sleep(1000);
         if (gameFocused()) { int s2 = screenState(segs); if (s2 != 1 && s2 != 3) break; }
         if (now() - lastBeep > 30) { MessageBeep(MB_ICONEXCLAMATION); lastBeep = now(); }
     }
@@ -1164,6 +1296,7 @@ static void fullScan(bool store = true) {
     int step = gBrain.notchesPerPage, scroll = 0;
     std::vector<double> shifts;
     for (int page = 0; page < 40 && !gQuit && !gPaused; page++) {
+        processCmds();
         setTask("Reading the store (page %d)", page + 1);
         auto its = readStorePage(scroll);
         std::string sig;
@@ -1208,6 +1341,7 @@ bakery:
     safeWheel(bx, by, -80); nap(gBrain.settleMs);
     prevSig.clear();
     for (int page = 0; page < 40 && !gQuit && !gPaused; page++) {
+        processCmds();
         setTask("Reading the bakery (page %d)", page + 1);
         auto bl = parseBakery(segment(ocrRect(L.bakery, 2.0, true)), L.bakery);
         std::string sig;
@@ -1333,6 +1467,7 @@ static bool buy(const Item &target, double predictedGain, const std::string &eff
         if (ok) {
             st.first++; st.second++;
             gBrain.purchases++; gBuyFails = 0;
+            if (gGoal.on && cur.key == gGoal.key) { gGoal.bought++; updateGoalHud(); }
             logf("BOUGHT %s for %s", cur.name.c_str(), fmtNum(cur.cost).c_str());
             { std::lock_guard<std::mutex> lk(gHud.mu); gHud.buysRun++; }
             // learn price growth
@@ -1717,11 +1852,9 @@ static void reply(const char *fmt, ...) {
 static void updateGoalHud() {
     std::string o;
     if (gGoal.on) {
-        auto f = gItems.find(gGoal.key);
-        int have = f != gItems.end() ? f->second.owned : gGoal.start;
         char b[160];
         if (gGoal.key.rfind("R:", 0) == 0) snprintf(b, sizeof b, "buy %s", gGoal.name.c_str());
-        else snprintf(b, sizeof b, "buy %d %s  -  %d / %d", gGoal.target - gGoal.start, gGoal.name.c_str(), std::max(0, have - gGoal.start), gGoal.target - gGoal.start);
+        else snprintf(b, sizeof b, "buy %d %s  -  %d / %d bought", gGoal.count, gGoal.name.c_str(), gGoal.bought, gGoal.count);
         o = b;
     }
     std::lock_guard<std::mutex> lk(gHud.mu); gHud.order = o;
@@ -1731,7 +1864,7 @@ static void checkGoal() {
     if (!gGoal.on) return;
     auto f = gItems.find(gGoal.key);
     bool research = gGoal.key.rfind("R:", 0) == 0;
-    if ((research && f == gItems.end()) || (!research && f != gItems.end() && f->second.owned >= gGoal.target)) {
+    if ((research && f == gItems.end()) || (!research && gGoal.bought >= gGoal.count)) {
         gGoal.on = false;
         reply("done: %s - back to normal play", gGoal.name.c_str());
     }
@@ -1771,7 +1904,8 @@ static void processCmds() {
             gGoal = Goal{};
             gGoal.on = true; gGoal.key = o.key; gGoal.name = o.name; gGoal.since = now();
             gGoal.start = std::max(0, it.owned);
-            gGoal.target = gGoal.start + (it.research ? 1 : o.count);
+            gGoal.count = it.research ? 1 : o.count;
+            gGoal.target = gGoal.start + gGoal.count;
             gBlack.erase(o.key);
             gBuyPauseUntil = 0;
             if (it.research) reply("on it: saving up for %s", o.name.c_str());
