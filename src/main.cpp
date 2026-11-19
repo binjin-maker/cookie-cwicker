@@ -31,7 +31,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 7;
+static const int VERSION = 8;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -949,7 +949,9 @@ static inline bool cookieColor(uint32_t p) {
 }
 struct Blob { int x0, y0, x1, y1, n; int cx() const { return (x0 + x1) / 2; } int cy() const { return (y0 + y1) / 2; } };
 
-static std::vector<Blob> findBlobs(const Img &im) {
+template <class F> static std::vector<Blob> findBlobsIf(const Img &im, F pred);
+static std::vector<Blob> findBlobs(const Img &im) { return findBlobsIf(im, [](uint32_t p) { return cookieColor(p); }); }
+template <class F> static std::vector<Blob> findBlobsIf(const Img &im, F cookieColor) {
     std::vector<Blob> out;
     std::vector<uint8_t> seen(im.px.size(), 0);
     std::vector<int> st;
@@ -976,14 +978,46 @@ static std::vector<Blob> findBlobs(const Img &im) {
     return out;
 }
 
+// the panel's background colour = most common colour around the image border
+static uint32_t gPanelBg = 0;
+static int colDist(uint32_t a, uint32_t b) {
+    return std::abs((int)((a >> 16) & 255) - (int)((b >> 16) & 255)) + std::abs((int)((a >> 8) & 255) - (int)((b >> 8) & 255)) +
+           std::abs((int)(a & 255) - (int)(b & 255));
+}
+static uint32_t borderMode(const Img &im) {
+    std::map<uint32_t, int> h;
+    auto add = [&](int x, int y) { h[im.px[(size_t)y * im.w + x] & 0xF8F8F8]++; };
+    for (int x = 0; x < im.w; x += 2) { add(x, 0); add(x, im.h - 1); }
+    for (int y = 0; y < im.h; y += 2) { add(0, y); add(im.w - 1, y); }
+    uint32_t best = 0; int n = -1;
+    for (auto &kv : h) if (kv.second > n) { n = kv.second; best = kv.first; }
+    return best;
+}
+
 static bool locateMainCookie() {
     Rect r = L.left;
     double s = 0.5;
     Img im = grab(r, s, false);
+    if (im.w < 20 || im.h < 20) return false;
     auto bl = findBlobs(im);
     const Blob *best = nullptr;
     for (auto &b : bl) if (!best || b.n > best->n) best = &b;
-    if (!best || best->n < 400) return false;
+    if (!best || best->n < 400) {
+        // cookie skin changed (new flavour etc): take the biggest round thing that isn't background
+        uint32_t bg = borderMode(im);
+        bl = findBlobsIf(im, [bg](uint32_t p) { return colDist(p & 0xF8F8F8, bg) > 70; });
+        best = nullptr;
+        for (auto &b : bl) {
+            int w = b.x1 - b.x0 + 1, h = b.y1 - b.y0 + 1;
+            double ar = (double)w / h;
+            if (ar < 0.7 || ar > 1.45 || b.n < 0.45 * w * h || b.n < 400) continue;
+            if (b.x0 <= 1 || b.y0 <= 1 || b.x1 >= im.w - 2 || b.y1 >= im.h - 2) continue;
+            if (!best || b.n > best->n) best = &b;
+        }
+        if (!best) { dbgf("cookie not found: %d blobs, panel bg %06X", (int)bl.size(), bg); return false; }
+        gPanelBg = bg;
+        logf("found the cookie by shape (its colour changed)");
+    } else gPanelBg = 0;
     L.cookieX = r.x0 + (int)(best->cx() / s);
     L.cookieY = r.y0 + (int)(best->cy() / s);
     L.cookieR = (int)(std::max(best->x1 - best->x0, best->y1 - best->y0) / s / 2);
@@ -992,7 +1026,8 @@ static bool locateMainCookie() {
 
 static bool cookieStillThere() {
     Img im = grab(Rect{L.cookieX - 20, L.cookieY - 20, L.cookieX + 20, L.cookieY + 20}, 1, false);
-    int n = 0; for (auto p : im.px) if (cookieColor(p)) n++;
+    int n = 0;
+    for (auto p : im.px) if (gPanelBg ? colDist(p & 0xF8F8F8, gPanelBg) > 70 : cookieColor(p)) n++;
     return n > (int)im.px.size() / 4;
 }
 
@@ -2116,7 +2151,11 @@ int main(int argc, char **argv) {
         }
         gOverlayOn = true;
         if (gMiss >= 3) { L.ok = false; gMiss = 0; continue; }
-        if (!cookieStillThere() && !locateMainCookie()) { L.ok = false; continue; }
+        if (!cookieStillThere() && !locateMainCookie()) {
+            static double lastMsg = 0;
+            if (now() - lastMsg > 20) { logf("lost the big cookie - re-finding the layout (details in cookiebot_debug.txt)"); lastMsg = now(); }
+            L.ok = false; continue;
+        }
 
         screenGuard();
         if (gQuit || gPaused || !L.ok) continue;
