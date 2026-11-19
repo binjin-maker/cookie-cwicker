@@ -450,6 +450,30 @@ static inline bool hasWord(const std::string &t, const char *w) {
     return false;
 }
 
+static inline int editDist(const std::string &a, const std::string &b) {
+    std::vector<int> d(b.size() + 1);
+    for (size_t j = 0; j <= b.size(); j++) d[j] = (int)j;
+    for (size_t i = 1; i <= a.size(); i++) {
+        int prev = d[0]; d[0] = (int)i;
+        for (size_t j = 1; j <= b.size(); j++) {
+            int t = d[j];
+            d[j] = std::min(std::min(d[j] + 1, d[j - 1] + 1), prev + (a[i - 1] == b[j - 1] ? 0 : 1));
+            prev = t;
+        }
+    }
+    return d[b.size()];
+}
+// does text contain f, allowing a typo or two
+static inline bool fuzzyHas(const std::string &tl, const std::string &f) {
+    if (tl.find(f) != std::string::npos) return true;
+    if (f.size() < 5) return false;
+    int tol = f.size() >= 9 ? 2 : 1;
+    for (int L = (int)f.size() - 1; L <= (int)f.size() + 1; L++)
+        for (int i = 0; i + L <= (int)tl.size(); i++)
+            if (editDist(tl.substr(i, L), f) <= tol) return true;
+    return false;
+}
+
 static inline Order parseOrder(const std::string &raw, const std::vector<std::pair<std::string, std::string>> &items) {
     Order o;
     std::string t = lower(raw);
@@ -482,7 +506,9 @@ static inline Order parseOrder(const std::string &raw, const std::vector<std::pa
         int bonus = it.first.rfind("B:", 0) == 0 ? 1 : 0;
         for (auto &f : forms) {
             size_t sc = f.first.size() * f.second * 2 + bonus;
-            if (f.first.size() >= 4 && tl.find(f.first) != std::string::npos && sc > best) { best = sc; o.key = it.first; o.name = it.second; }
+            if (f.first.size() < 4 || sc <= best) continue;
+            if (tl.find(f.first) != std::string::npos) { best = sc; o.key = it.first; o.name = it.second; }
+            else if (fuzzyHas(tl, f.first)) { best = sc - 1; o.key = it.first; o.name = it.second; }
         }
     }
 
@@ -506,6 +532,17 @@ static inline Order parseOrder(const std::string &raw, const std::vector<std::pa
     if (hasWord(t, "buying") || hasWord(t, "buy") || hasWord(t, "upgrades") || hasWord(t, "purchases")) {
         if (off) { o.kind = O_BUYOFF; return o; }
         if (on || hasWord(t, "buying")) { o.kind = O_BUYON; return o; }
+    }
+    if (hasWord(t, "buy") || hasWord(t, "get") || hasWord(t, "save") || hasWord(t, "purchase") || hasWord(t, "grab")) {
+        // wants something we can't see yet: keep what they named
+        static const char *skip[] = {"buy", "get", "save", "up", "for", "and", "me", "a", "an", "the", "some", "more", "purchase", "grab", "please", "pls", "to", "another", "of"};
+        std::string nm;
+        for (auto &tk : split(t)) {
+            bool sk = isdigit((unsigned char)tk[0]);
+            for (auto w : skip) if (tk == w) sk = true;
+            if (!sk) nm += (nm.empty() ? "" : " ") + tk;
+        }
+        if (!nm.empty()) { o.kind = O_BUY; o.name = nm; o.count = num >= 1 ? std::min(500, (int)num) : 1; }
     }
     return o;
 }
@@ -657,7 +694,7 @@ static inline Effect understand(const Item &it, const std::vector<std::string> &
 }
 
 // ================= simulator + planner =================
-struct SimItem { std::string key, name; bool research; double cost, growth; Effect eff; };
+struct SimItem { std::string key, name; bool research; double cost, growth; Effect eff; double corr = 1, unk = 0.03; };
 struct SimState {
     double bank, cps, perClick, rate;
     std::map<std::string, double> unit, total;  // per building (current multipliers baked in)
@@ -668,14 +705,15 @@ struct SimState {
 
 static inline double effGain(const SimItem &it, const SimState &s, const Brain &B, const std::string &text) {
     const Effect &e = it.eff;
-    double c = B.corrFor(e.type());
+    double c = it.corr;
+    (void)B; (void)text;
     switch (e.kind) {
     case E_BUILD: { auto f = s.unit.find(e.target); return f == s.unit.end() ? 0 : f->second; }
     case E_BMULT: { auto f = s.total.find(e.target); return f == s.total.end() ? 0 : f->second * (e.v - 1) * c; }
     case E_CLICKPCT: return s.cps * e.v / 100 * s.rate * c;
     case E_CLICKMULT: return s.perClick * (e.v - 1) * s.rate * c;
     case E_GLOBAL: return s.cps * e.v * c;
-    case E_UNKNOWN: return s.P() * B.predictUnknown(text) * c;
+    case E_UNKNOWN: return s.P() * it.unk * c;
     default: return 0;
     }
 }
@@ -699,7 +737,7 @@ struct Plan { int first = -1; double value = 0, wait = 0, gain = 0; std::string 
 
 // greedy-by-payback rollout, used inside the planner. every purchase costs buyOverhead seconds of no clicking.
 static inline double rollout(std::vector<SimItem> items, std::vector<std::string> texts, SimState s, int forced, double T, double tail,
-                             const Brain &B, int maxSteps = 5000) {
+                             const Brain &B, int maxSteps = 600) {
     double t = 0, oh = B.buyOverhead;
     for (int step = 0; step < maxSteps; step++) {
         double ohLoss = oh * s.perClick * s.rate;
@@ -737,6 +775,8 @@ static inline Plan plan(const std::vector<Item> &list, SimState s, const Brain &
     std::vector<SimItem> items; std::vector<std::string> texts;
     for (auto &it : list) {
         SimItem si{it.key, it.name, it.research, it.cost, B.growthFor(it.key), understand(it, bks)};
+        si.corr = B.corrFor(si.eff.type());
+        if (si.eff.kind == E_UNKNOWN) si.unk = B.predictUnknown(it.name + " " + it.desc);
         items.push_back(si); texts.push_back(it.name + " " + it.desc);
     }
     double T = std::min(sessionLeft, 4 * 3600.0), tail = 3600;

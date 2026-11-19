@@ -247,7 +247,11 @@ CONTENTS
   - Never saves for anything it can't afford before the current
     session ends (session = --hours, rolling over every N hours,
     minimum 20 min window).
-  - Production counts clicking too: cps + per-click x 12.
+  - Production counts clicking too: cps + per-click x the click rate
+    it actually achieved this run (scans and buys mean it's below 12).
+    The cookie count between reads is estimated from cps x time plus
+    per-click x the real number of cookie clicks, so it doesn't run
+    ahead of the game's counter.
   - Sanity check: the bakery's per-building /sec numbers must add up
     to the real cookies/sec. If they're off by more than 1.5x (OCR
     missed a "million" etc.) they all get rescaled to match, and the
@@ -535,7 +539,10 @@ CONTENTS
   after 30 s of no typing. It doesn't chat back - it just does it,
   and shows a one-line note of what it did.
 
-  Things it understands (wording is loose):
+  Things it understands (wording is loose, small typos are fine).
+  If you order something it can't see in the store yet (or the store
+  hasn't been read yet), it rescans and keeps the order for 20 min,
+  buying it as soon as it shows up.
     buy 10 grandmas / save up for a dough portal / get 2 bakeries
         -> becomes its goal. It saves up and buys only that until
            done, then goes back to normal play. Works for research

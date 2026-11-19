@@ -31,7 +31,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 4;
+static const int VERSION = 5;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -331,15 +331,17 @@ static void overlayThread() {
                     double u = (i + ph0) / n;
                     if (u > 1) continue;
                     double x, y; at(u, x, y);
-                    if (std::hypot(x - c.x, y - c.y) < 38 || std::hypot(x - bx, y - by) < 16) continue;
-                    float a = (float)(0.25 + 0.65 * u) * (pt.glide ? 1.f : 0.8f);
-                    pc.disc((float)(x - x0), (float)(y - y0), 2.3f, 120, 205, 255, a);
+                    if (std::hypot(x - c.x, y - c.y) < 38 || std::hypot(x - bx, y - by) < 24) continue;
+                    float a = (float)(0.6 + 0.4 * u);
+                    pc.disc((float)(x - x0), (float)(y - y0), 5.2f, 5, 15, 40, a * 0.7f);
+                    pc.disc((float)(x - x0), (float)(y - y0), 3.8f, 110, 210, 255, a);
                 }
-                float tx = (float)(bx - x0), ty = (float)(by - y0), pulse = 11 + 2.5f * std::sin(t * 6);
-                pc.ring(tx, ty, pulse, 2.f, 150, 215, 255, 0.9f);
+                float tx = (float)(bx - x0), ty = (float)(by - y0), pulse = 14 + 3 * std::sin(t * 6);
+                pc.ring(tx, ty, pulse, 5.5f, 5, 15, 40, 0.7f);
+                pc.ring(tx, ty, pulse, 3.5f, 150, 220, 255, 1.f);
                 for (int i = 0; i < 4; i++) {
                     float ang = t * 1.5f + i * 1.5708f;
-                    pc.disc(tx + std::cos(ang) * 19, ty + std::sin(ang) * 19, 2.f, 150, 215, 255, 0.8f);
+                    pc.disc(tx + std::cos(ang) * 24, ty + std::sin(ang) * 24, 3.4f, 150, 220, 255, 1.f);
                 }
                 if (pt.dir) for (int i = 0; i < 3; i++) {
                     float yy = ty + pt.dir * (24 + i * 7 + std::fmod(t * 20, 7.f));
@@ -354,21 +356,29 @@ static void overlayThread() {
             // green box around whatever it's reading
             Rect rr; double rat;
             { std::lock_guard<std::mutex> lk(gFxMu); rr = gReadRect; rat = gReadAt; }
-            if (now() - rat < 0.8 && rr.x1 > rr.x0 && !gCapturing) {
+            if (now() - rat < 1.2 && rr.x1 > rr.x0 && !gCapturing) {
                 if (memcmp(&rr, &readDrawn, sizeof rr) != 0 || !readShown) {
-                    int m = 4, w = rr.x1 - rr.x0 + 2 * m, hh = rr.y1 - rr.y0 + 2 * m;
+                    int m = 8, w = rr.x1 - rr.x0 + 2 * m, hh = rr.y1 - rr.y0 + 2 * m;
                     rbuf.assign((size_t)w * hh, 0);
-                    int th = 2, cl = std::min(18, std::min(w, hh) / 3);
-                    auto put = [&](int x, int y, float a) {
+                    auto put = [&](int x, int y, int r, int g, int b, float a) {
                         if (x < 0 || y < 0 || x >= w || y >= hh) return;
-                        uint32_t A = (uint32_t)(a * 255);
-                        rbuf[(size_t)y * w + x] = (A << 24) | ((uint32_t)(a * 60) << 16) | ((uint32_t)(a * 235) << 8) | (uint32_t)(a * 110);
+                        rbuf[(size_t)y * w + x] = ((uint32_t)(a * 255) << 24) | ((uint32_t)(r * a) << 16) | ((uint32_t)(g * a) << 8) | (uint32_t)(b * a);
                     };
-                    for (int x = 0; x < w; x++) for (int t = 0; t < th; t++) { put(x, t, 0.75f); put(x, hh - 1 - t, 0.75f); }
-                    for (int y = 0; y < hh; y++) for (int t = 0; t < th; t++) { put(t, y, 0.75f); put(w - 1 - t, y, 0.75f); }
-                    for (int i = 0; i < cl; i++) for (int t = th; t < th + 2; t++) {
-                        put(i, t, 1); put(t, i, 1); put(w - 1 - i, t, 1); put(w - 1 - t, i, 1);
-                        put(i, hh - 1 - t, 1); put(t, hh - 1 - i, 1); put(w - 1 - i, hh - 1 - t, 1); put(w - 1 - t, hh - 1 - i, 1);
+                    for (int y = m; y < hh - m; y++) for (int x = m; x < w - m; x++) put(x, y, 40, 255, 90, 0.07f);
+                    auto band = [&](int t0, int t1, int r, int g, int b, float a) {
+                        for (int t = t0; t < t1; t++) {
+                            for (int x = t; x < w - t; x++) { put(x, t, r, g, b, a); put(x, hh - 1 - t, r, g, b, a); }
+                            for (int y = t; y < hh - t; y++) { put(t, y, r, g, b, a); put(w - 1 - t, y, r, g, b, a); }
+                        }
+                    };
+                    band(2, 3, 0, 40, 10, 0.8f);
+                    band(3, 7, 50, 255, 100, 1.f);
+                    band(7, 8, 0, 40, 10, 0.8f);
+                    int cl = std::min(40, std::min(w, hh) / 3);
+                    for (int i = 0; i < cl; i++) for (int t = 0; t < 3; t++) {
+                        put(i, t, 170, 255, 190, 1); put(t, i, 170, 255, 190, 1); put(w - 1 - i, t, 170, 255, 190, 1); put(w - 1 - t, i, 170, 255, 190, 1);
+                        put(i, hh - 1 - t, 170, 255, 190, 1); put(t, hh - 1 - i, 170, 255, 190, 1);
+                        put(w - 1 - i, hh - 1 - t, 170, 255, 190, 1); put(w - 1 - t, hh - 1 - i, 170, 255, 190, 1);
                     }
                     pushLayered(gRead, rr.x0 - m, rr.y0 - m, w, hh, rbuf.data());
                     readDrawn = rr;
@@ -898,7 +908,18 @@ static double gLastRefresh = -100;
 static Econ gEcon;
 static double gEconTime = 0;
 
-static double prodNow(const Econ &e) { return std::max(0.0, e.cps) + std::max(0.0, e.perClick) * cfgCps; }
+
+static std::atomic<long long> gCookieClicks{0};
+static long long gClicksAtRead = 0;
+static double effRate() {
+    double up = gStart > 0 ? now() - gStart : 0;
+    if (up < 60 || gCookieClicks < 100) return cfgCps * 0.8;
+    return std::min(cfgCps, gCookieClicks / up);
+}
+static double prodNow(const Econ &e) { return std::max(0.0, e.cps) + std::max(0.0, e.perClick) * effRate(); }
+static double bankNow() {
+    return gEcon.bank + std::max(0.0, gEcon.cps) * (now() - gEconTime) + std::max(0.0, gEcon.perClick) * (double)(gCookieClicks - gClicksAtRead);
+}
 
 static bool readEconNow() {
     Rect r = L.left;
@@ -918,7 +939,7 @@ static bool readEconNow() {
         return false;
     }
     if (e.perClick < 0) e.perClick = gEcon.perClick > 0 ? gEcon.perClick : 0;
-    gEcon = e; gEconTime = now();
+    gEcon = e; gEconTime = now(); gClicksAtRead = gCookieClicks;
     // did a bonus cookie do something?
     if (gLastBonus > 0 && now() - gLastBonus < 8 && gBonusP > 0) {
         if (prodNow(e) > gBonusP * 1.1) { gBrain.bonusHelped++; logf("bonus cookie boosted production %.1fx", prodNow(e) / gBonusP); }
@@ -926,7 +947,6 @@ static bool readEconNow() {
     }
     return true;
 }
-static double bankNow() { return gEcon.bank + prodNow(gEcon) * (now() - gEconTime); }
 
 static void clickSpawned() {
     if (!cfgGolden) return;
@@ -1231,7 +1251,7 @@ static SimState currentState(std::vector<Item> &list) {
     std::vector<BakeryLine> bl;
     for (auto &kv : gBakery) bl.push_back(kv.second);
     Econ e = gEcon; e.bank = bankNow();
-    SimState st = makeState(e, bl, list, cfgCps, gBrain);
+    SimState st = makeState(e, bl, list, effRate(), gBrain);
     static double lastFix = 1;
     if (std::abs(st.fix / lastFix - 1) > 0.25) {
         if (st.fix != 1) logf("building readings only add up to 1/%.3g of real cps - scaling them x%.3g", st.fix, st.fix);
@@ -1664,6 +1684,7 @@ static void clickFor(double seconds) {
         { std::lock_guard<std::mutex> lk(gPromptMu); if (!gCmds.empty()) break; }
         if (cfgGolden && now() >= nextSpawn) { clickSpawned(); nextSpawn = now() + 0.4; }
         if (!safeClick(L.cookieX + (rand() % 11 - 5), L.cookieY + (rand() % 11 - 5))) break;
+        gCookieClicks++;
     }
 }
 
@@ -1699,16 +1720,35 @@ static void checkGoal() {
     updateGoalHud();
 }
 
+struct Pending { std::string text; double until; };
+static std::vector<Pending> gPending;
+static double gPendingTried = 0;
+
 static void processCmds() {
     std::deque<std::string> q;
     { std::lock_guard<std::mutex> lk(gPromptMu); q.swap(gCmds); }
+    std::set<std::string> retry;
+    if (!gPending.empty() && gLastFull > gPendingTried) {
+        gPendingTried = gLastFull;
+        for (auto &p : gPending) if (now() < p.until) { q.push_back(p.text); retry.insert(p.text); }
+        gPending.clear();
+    }
     for (auto &c : q) {
-        logf("you typed: \"%s\"", c.c_str());
+        bool again = retry.count(c) > 0;
+        if (!again) logf("you typed: \"%s\"", c.c_str());
         std::vector<std::pair<std::string, std::string>> names;
         for (auto &kv : gItems) names.push_back({kv.first, kv.second.name});
         Order o = parseOrder(c, names);
         switch (o.kind) {
         case O_BUY: {
+            if (o.key.empty()) {
+                if (!again) {
+                    gPending.push_back({c, now() + 1200});
+                    if (!gItems.empty()) gLastFull = -1000;
+                    reply("can't see \"%s\" in the store yet - rescanning, will buy it once it shows up", o.name.c_str());
+                } else gPending.push_back({c, now() + 1200});
+                break;
+            }
             auto &it = gItems[o.key];
             gGoal = Goal{};
             gGoal.on = true; gGoal.key = o.key; gGoal.name = o.name; gGoal.since = now();
@@ -1739,8 +1779,8 @@ static void processCmds() {
         case O_UPDATE: gUpdateCheckReq = true; reply("checking GitHub for updates"); break;
         case O_HELP: reply("try: buy 10 grandmas / skip bakery / cancel / bonus off / clicks 8 / rescan / pause"); break;
         default:
-            if (gItems.empty()) reply("haven't read the store yet - try again in a bit");
-            else reply("didn't get that - type \"help\"");
+            if (gItems.empty()) { gPending.push_back({c, now() + 1200}); reply("got it - will do that once the store is read"); }
+            else if (!again) reply("didn't get that - type \"help\"");
         }
         if (gPanel) InvalidateRect(gPanel, nullptr, TRUE);
     }
