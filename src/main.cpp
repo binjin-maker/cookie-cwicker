@@ -31,24 +31,34 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 1;
+static const int VERSION = 2;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
 static std::atomic<bool> gPaused{false}, gQuit{false}, gOverlayOn{false};
 static std::atomic<double> gResumeAt{0};
 static HWND gHwnd = nullptr;
-static RECT gMon{};
+static RECT gMon{}, gWork{};
 static FILE *gLog = nullptr, *gDbg = nullptr;
 static LARGE_INTEGER gFreq;
 static double gStart = 0;
 static Brain gBrain;
+static std::atomic<bool> gUpdateCheckReq{false};
+
+// prompt bar: typed orders
+static std::mutex gPromptMu;
+static std::string gPromptText, gReply;
+static std::atomic<bool> gPromptOpen{false};
+static double gPromptLast = 0, gReplyAt = -100;
+static std::deque<std::string> gCmds;
+struct Goal { bool on = false; std::string key, name; int target = 0, start = 0; double since = 0; };
+static Goal gGoal;
 
 static double now() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return (double)c.QuadPart / gFreq.QuadPart; }
 
 struct HudState {
     std::mutex mu;
-    std::string state = "STARTING", task = "Starting up", want, wantType, why;
+    std::string state = "STARTING", task = "Starting up", want, wantType, why, order;
     double wantCost = 0, wantGain = 0;
     std::vector<std::pair<std::string, double>> alts;
     std::deque<std::string> lines, log;
@@ -114,6 +124,14 @@ struct Burst { int x, y; double t; bool big; };
 static std::mutex gFxMu;
 static std::vector<Burst> gBursts;
 static const int FXS = 260;
+static HWND gPath = nullptr;
+static std::atomic<bool> gCapturing{false};
+struct PathT { bool glide = false; int sx = 0, sy = 0, tx = 0, ty = 0; double amp = 0; bool next = false; int nx = 0, ny = 0, dir = 0; };
+static PathT gPathT;
+static void setNext(bool on, int x = 0, int y = 0, int dir = 0) {
+    std::lock_guard<std::mutex> lk(gFxMu);
+    gPathT.next = on; gPathT.nx = x; gPathT.ny = y; gPathT.dir = dir;
+}
 
 static void fxClick(int x, int y, bool big = false) {
     std::lock_guard<std::mutex> lk(gFxMu);
@@ -152,7 +170,7 @@ struct Canvas {
     }
 };
 
-static void pushLayered(HWND h, int x, int y, int w, int hgt, const uint32_t *src) {
+static void pushLayered(HWND h, int x, int y, int w, int hgt, const uint32_t *src, bool keepPos = false) {
     HDC scr = GetDC(nullptr), mem = CreateCompatibleDC(scr);
     BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -hgt; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
@@ -162,7 +180,7 @@ static void pushLayered(HWND h, int x, int y, int w, int hgt, const uint32_t *sr
     HGDIOBJ old = SelectObject(mem, bmp);
     POINT pos{x, y}, zero{0, 0}; SIZE sz{w, hgt};
     BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    UpdateLayeredWindow(h, scr, &pos, &sz, mem, &zero, 0, &bf, ULW_ALPHA);
+    UpdateLayeredWindow(h, scr, keepPos ? nullptr : &pos, &sz, mem, &zero, 0, &bf, ULW_ALPHA);
     SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem); ReleaseDC(nullptr, scr);
 }
 
@@ -188,15 +206,43 @@ static HWND makeOverlay(const wchar_t *cls, bool &excluded) {
     return h;
 }
 
+// HUD can be dragged while paused; position is kept in cookiebot_hud.txt
+static std::atomic<bool> gHudDrag{false};
+static int gHudDX = -1, gHudDY = -1;
+static void loadHudPos() { if (FILE *f = fopen("cookiebot_hud.txt", "r")) { if (fscanf(f, "%d %d", &gHudDX, &gHudDY) != 2) gHudDX = gHudDY = -1; fclose(f); } }
+static LRESULT CALLBACK hudProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_NCHITTEST: return HTCAPTION;
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_ENTERSIZEMOVE: gHudDrag = true; return 0;
+    case WM_EXITSIZEMOVE: {
+        RECT r; GetWindowRect(h, &r);
+        gHudDX = std::max(0, (int)(r.left - gWork.left)); gHudDY = std::max(0, (int)(gWork.bottom - r.bottom));
+        if (FILE *f = fopen("cookiebot_hud.txt", "w")) { fprintf(f, "%d %d\n", gHudDX, gHudDY); fclose(f); }
+        gHudDrag = false;
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
 static void overlayThread() {
     WNDCLASSW wc{}; wc.lpfnWndProc = DefWindowProcW; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"CookieBotFx";
     RegisterClassW(&wc);
     bool e1 = false, e2 = false;
     gVig = makeOverlay(L"CookieBotFx", e1);
     gFx = makeOverlay(L"CookieBotFx", e2);
-    bool e3 = false;
-    gHudWnd = makeOverlay(L"CookieBotFx", e3);
-    gHiddenFromCapture = e1 && e2 && e3;
+    bool e3 = false, e4 = false;
+    WNDCLASSW hc{}; hc.lpfnWndProc = hudProc; hc.hInstance = GetModuleHandleW(nullptr); hc.lpszClassName = L"CookieBotHud";
+    hc.hCursor = LoadCursor(nullptr, IDC_SIZEALL);
+    RegisterClassW(&hc);
+    gHudWnd = makeOverlay(L"CookieBotHud", e3);
+    loadHudPos();
+    bool hudGrab = false;
+    gPath = makeOverlay(L"CookieBotFx", e4);
+    gHiddenFromCapture = e1 && e2 && e3 && e4;
+    bool pathShown = false;
+    std::vector<uint32_t> pbuf;
     bool hudShown = false;
     double lastHud = 0;
     RECT lastMon{};
@@ -211,12 +257,18 @@ static void overlayThread() {
             if (on) {
                 if (memcmp(&lastMon, &gMon, sizeof(RECT)) != 0) { renderVignette(gMon); lastMon = gMon; }
                 ShowWindow(gVig, SW_SHOWNOACTIVATE); ShowWindow(gFx, SW_SHOWNOACTIVATE);
-            } else { ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); }
+            } else { ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gPath, SW_HIDE); pathShown = false; }
             shown = on; gVigVisible = on;
         }
-        bool hudOn = cfgFx && gHwnd && gameFocused() && !gQuit;
+        bool hudOn = (cfgFx || gPromptOpen) && gHwnd && gameFocused() && !gQuit;
         if (hudOn != hudShown) { ShowWindow(gHudWnd, hudOn ? SW_SHOWNOACTIVATE : SW_HIDE); hudShown = hudOn; }
         if (hudOn && now() - lastHud > 0.1) { renderHud(); lastHud = now(); }
+        bool grab = gPaused;
+        if (grab != hudGrab) {
+            LONG ex = GetWindowLongW(gHudWnd, GWL_EXSTYLE);
+            SetWindowLongW(gHudWnd, GWL_EXSTYLE, grab ? (ex & ~WS_EX_TRANSPARENT) : (ex | WS_EX_TRANSPARENT));
+            hudGrab = grab;
+        }
         if (shown) {
             POINT c; GetCursorPos(&c);
             int wx = c.x - FXS / 2, wy = c.y - FXS / 2;
@@ -248,12 +300,55 @@ static void overlayThread() {
                 }
             }
             pushLayered(gFx, wx, wy, FXS, FXS, buf.data());
+
+            // dotted path to where the cursor is headed
+            PathT pt; { std::lock_guard<std::mutex> lk(gFxMu); pt = gPathT; }
+            bool draw = false;
+            double ax = c.x, ay = c.y, bx = 0, by = 0, amp = 0;
+            if (pt.glide) { ax = pt.sx; ay = pt.sy; bx = pt.tx; by = pt.ty; amp = pt.amp; draw = true; }
+            else if (pt.next) { bx = pt.nx; by = pt.ny; draw = true; }
+            double dd = std::hypot(bx - ax, by - ay);
+            if (draw && dd > 70 && !gCapturing) {
+                if (!pt.glide) amp = dd * 0.08;
+                double ux = (bx - ax) / dd, uy = (by - ay) / dd, px = -uy, py = ux;
+                auto at = [&](double u, double &x, double &y) { double b = std::sin(3.14159 * u) * amp; x = ax + (bx - ax) * u + px * b; y = ay + (by - ay) * u + py * b; };
+                int M = 40;
+                double x0 = std::min(ax, bx) - std::fabs(amp) - M, y0 = std::min(ay, by) - std::fabs(amp) - M;
+                double x1 = std::max(ax, bx) + std::fabs(amp) + M, y1 = std::max(ay, by) + std::fabs(amp) + M;
+                int pw = (int)(x1 - x0), ph = (int)(y1 - y0);
+                pbuf.assign((size_t)pw * ph, 0);
+                Canvas pc{pw, ph, pbuf.data()};
+                int n = std::max(3, (int)(dd / 15));
+                double ph0 = std::fmod(t * 1.4, 1.0);
+                for (int i = 0; i <= n; i++) {
+                    double u = (i + ph0) / n;
+                    if (u > 1) continue;
+                    double x, y; at(u, x, y);
+                    if (std::hypot(x - c.x, y - c.y) < 38 || std::hypot(x - bx, y - by) < 16) continue;
+                    float a = (float)(0.25 + 0.65 * u) * (pt.glide ? 1.f : 0.8f);
+                    pc.disc((float)(x - x0), (float)(y - y0), 2.3f, 120, 205, 255, a);
+                }
+                float tx = (float)(bx - x0), ty = (float)(by - y0), pulse = 11 + 2.5f * std::sin(t * 6);
+                pc.ring(tx, ty, pulse, 2.f, 150, 215, 255, 0.9f);
+                for (int i = 0; i < 4; i++) {
+                    float ang = t * 1.5f + i * 1.5708f;
+                    pc.disc(tx + std::cos(ang) * 19, ty + std::sin(ang) * 19, 2.f, 150, 215, 255, 0.8f);
+                }
+                if (pt.dir) for (int i = 0; i < 3; i++) {
+                    float yy = ty + pt.dir * (24 + i * 7 + std::fmod(t * 20, 7.f));
+                    pc.disc(tx - 6 + i * 0.f, yy - pt.dir * 4, 1.8f, 150, 215, 255, 0.7f - i * 0.2f);
+                    pc.disc(tx + 6, yy - pt.dir * 4, 1.8f, 150, 215, 255, 0.7f - i * 0.2f);
+                    pc.disc(tx, yy, 1.8f, 150, 215, 255, 0.7f - i * 0.2f);
+                }
+                pushLayered(gPath, (int)x0, (int)y0, pw, ph, pbuf.data());
+                if (!pathShown) { ShowWindow(gPath, SW_SHOWNOACTIVATE); pathShown = true; }
+            } else if (pathShown) { ShowWindow(gPath, SW_HIDE); pathShown = false; }
             { std::lock_guard<std::mutex> lk(gFxMu);
               gBursts.erase(std::remove_if(gBursts.begin(), gBursts.end(), [](const Burst &b) { return now() - b.t > 1; }), gBursts.end()); }
         }
         Sleep(16);
     }
-    ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gHudWnd, SW_HIDE);
+    ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gHudWnd, SW_HIDE); ShowWindow(gPath, SW_HIDE);
 }
 
 // ================= input =================
@@ -288,6 +383,8 @@ static bool glideTo(int x, int y) {
     double dur = std::min(0.26, std::max(0.07, d / 3800.0 + 0.06));
     double amp = d * 0.08 * ((rand() & 1) ? 1 : -1), nx = -dy / d, ny = dx / d;
     double t0 = now();
+    { std::lock_guard<std::mutex> lk(gFxMu); gPathT.glide = true; gPathT.sx = p.x; gPathT.sy = p.y; gPathT.tx = x; gPathT.ty = y; gPathT.amp = amp; }
+    struct End { ~End() { std::lock_guard<std::mutex> lk(gFxMu); gPathT.glide = false; } } endGlide;
     for (;;) {
         if (!canAct()) return false;
         double t = std::min(1.0, (now() - t0) / dur);
@@ -351,8 +448,49 @@ static LRESULT CALLBACK mouseHook(int code, WPARAM wp, LPARAM lp) {
     return CallNextHookEx(nullptr, code, wp, lp);
 }
 
+static void promptClose() { std::lock_guard<std::mutex> lk(gPromptMu); gPromptText.clear(); gPromptOpen = false; }
+
+static LRESULT CALLBACK keyHook(int code, WPARAM wp, LPARAM lp) {
+    if (code != HC_ACTION) return CallNextHookEx(nullptr, code, wp, lp);
+    auto *k = (KBDLLHOOKSTRUCT *)lp;
+    if (k->flags & LLKHF_INJECTED) return CallNextHookEx(nullptr, code, wp, lp);
+    DWORD vk = k->vkCode;
+    bool down = wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN;
+    bool mods = (GetAsyncKeyState(VK_CONTROL) & 0x8000) || (GetAsyncKeyState(VK_MENU) & 0x8000) || (GetAsyncKeyState(VK_LWIN) & 0x8000);
+    if (vk == VK_F8 || vk == VK_F9 || mods) return CallNextHookEx(nullptr, code, wp, lp);
+    if (!gPromptOpen) {
+        if (down && vk >= 'A' && vk <= 'Z' && gOverlayOn && !gPaused && gHwnd && GetForegroundWindow() == gHwnd) {
+            std::lock_guard<std::mutex> lk(gPromptMu);
+            gPromptText = std::string(1, (char)(vk - 'A' + 'a'));
+            gPromptOpen = true; gPromptLast = now();
+            return 1;
+        }
+        return CallNextHookEx(nullptr, code, wp, lp);
+    }
+    if (GetForegroundWindow() != gHwnd) { promptClose(); return CallNextHookEx(nullptr, code, wp, lp); }
+    if (!down) return 1;
+    std::lock_guard<std::mutex> lk(gPromptMu);
+    gPromptLast = now();
+    bool shift = GetAsyncKeyState(VK_SHIFT) & 0x8000;
+    if (vk == VK_ESCAPE) { gPromptText.clear(); gPromptOpen = false; }
+    else if (vk == VK_RETURN) {
+        if (!gPromptText.empty()) gCmds.push_back(gPromptText);
+        gPromptText.clear(); gPromptOpen = false;
+    } else if (vk == VK_BACK) { if (!gPromptText.empty()) gPromptText.pop_back(); if (gPromptText.empty()) gPromptOpen = false; }
+    else if (gPromptText.size() < 80) {
+        if (vk >= 'A' && vk <= 'Z') gPromptText += (char)(vk - 'A' + 'a');
+        else if (vk >= '0' && vk <= '9' && !shift) gPromptText += (char)vk;
+        else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) gPromptText += (char)('0' + vk - VK_NUMPAD0);
+        else if (vk == VK_SPACE) gPromptText += ' ';
+        else if (vk == VK_OEM_PERIOD || vk == VK_DECIMAL) gPromptText += '.';
+        else if (vk == VK_OEM_7) gPromptText += '\'';
+    }
+    return 1;
+}
+
 static void inputThread() {
     HHOOK h = SetWindowsHookExW(WH_MOUSE_LL, mouseHook, GetModuleHandleW(nullptr), 0);
+    HHOOK hk = SetWindowsHookExW(WH_KEYBOARD_LL, keyHook, GetModuleHandleW(nullptr), 0);
     bool f8 = false, f9 = false;
     while (!gQuit) {
         MSG msg;
@@ -364,9 +502,11 @@ static void inputThread() {
         }
         if (k9 && !f9) { gQuit = true; logf("Quitting."); }
         f8 = k8; f9 = k9;
+        if (gPromptOpen && now() - gPromptLast > 30) promptClose();
         Sleep(10);
     }
     if (h) UnhookWindowsHookEx(h);
+    if (hk) UnhookWindowsHookEx(hk);
 }
 
 // ================= screen capture =================
@@ -378,7 +518,7 @@ static Img grab(const Rect &r, double scale, bool smooth) {
     if (sw <= 0 || sh <= 0) return im;
     bool hide = !gHiddenFromCapture && (gVigVisible || IsWindowVisible(gHudWnd));
     bool hudWas = hide && IsWindowVisible(gHudWnd), vigWas = hide && gVigVisible;
-    if (hide) { ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gHudWnd, SW_HIDE); Sleep(40); }
+    if (hide) { gCapturing = true; ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gHudWnd, SW_HIDE); ShowWindow(gPath, SW_HIDE); Sleep(40); }
     im.w = std::max(1, (int)(sw * scale)); im.h = std::max(1, (int)(sh * scale));
     HDC scr = GetDC(nullptr), mem = CreateCompatibleDC(scr);
     BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -395,6 +535,7 @@ static Img grab(const Rect &r, double scale, bool smooth) {
     SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem); ReleaseDC(nullptr, scr);
     if (vigWas) { ShowWindow(gVig, SW_SHOWNOACTIVATE); ShowWindow(gFx, SW_SHOWNOACTIVATE); }
     if (hudWas) ShowWindow(gHudWnd, SW_SHOWNOACTIVATE);
+    gCapturing = false;
     return im;
 }
 
@@ -909,9 +1050,32 @@ static std::vector<Item> readStorePage(int scroll) {
     return items;
 }
 
-static void fullScan() {
+static bool readTip(Item &it) {
+    if (it.research || !it.nx) return false;
+    if (!canAct() || !pointSafe(it.nx, it.ny) || !glideTo(it.nx, it.ny)) return false;
+    nap(280);
+    Rect r{std::max(L.game.x0, L.store.x0 - 760), std::max(L.game.y0, it.ny - 380), L.store.x0 + 12, std::min(L.game.y1, it.ny + 380)};
+    double v; int kind;
+    for (int pass = 0; pass < 2; pass++) {
+        auto segs = segment(ocrRect(r, 1.6, pass == 1));
+        if (parseTip(segs, it.name, v, kind)) {
+            it.tip = v; it.tipKind = kind;
+            dbgf("  TIP %s: %s %s", it.name.c_str(), fmtNum(v).c_str(), kind == 2 ? "per click" : "per sec");
+            return true;
+        }
+        if (pass == 0) for (auto &sg : segs) dbgf("  tipseg '%s'", sg.text.c_str());
+    }
+    dbgf("  TIP %s: not found", it.name.c_str());
+    return false;
+}
+
+static void fullScan(bool store = true) {
     setTask("Reading cookie count");
     if (!readEconNow()) { logf("couldn't read cookie count"); gMiss++; return; }
+    std::map<std::string, Item> items;
+    std::string prevSig;
+    if (!store) goto bakery;
+    {
     int sx = (L.store.x0 + L.store.x1) / 2, sy = (L.store.y0 + L.store.y1) / 2;
     storeTop();
     auto first = segment(ocrRect(L.store, 2.0));
@@ -927,8 +1091,6 @@ static void fullScan() {
         std::string l = lower(s.text);
         if (l.rfind("show all", 0) == 0 && s.text.size() < 16) { safeClick(s.cx(), s.cy()); nap(500); break; }
     }
-    std::map<std::string, Item> items;
-    std::string prevSig;
     std::vector<Item> prev;
     int step = gBrain.notchesPerPage, scroll = 0;
     std::vector<double> shifts;
@@ -941,7 +1103,15 @@ static void fullScan() {
         // learn how far one page of scrolling moves things
         for (auto &a : its) for (auto &b : prev) if (a.key == b.key) shifts.push_back((double)(b.ny - a.ny) / (L.store.y1 - L.store.y0));
         prevSig = sig; prev = its;
-        for (auto &i : its) if (!items.count(i.key)) items[i.key] = i;
+        for (auto &i : its) {
+            if (items.count(i.key)) continue;
+            if (!i.research) {
+                setTask("Reading the %s tooltip", i.name.c_str());
+                if (!readTip(i)) { auto f = gItems.find(i.key); if (f != gItems.end()) { i.tip = f->second.tip; i.tipKind = f->second.tipKind; } }
+            }
+            items[i.key] = i;
+        }
+        if (gQuit || gPaused) return;
         if (!safeWheel(sx, sy, step)) return;
         scroll += step;
         nap(gBrain.settleMs);
@@ -961,6 +1131,8 @@ static void fullScan() {
         logf("scan: %s cookies, %s/s | %d store items", fmtNum(gEcon.bank).c_str(), fmtNum(gEcon.cps).c_str(), (int)items.size());
         return;
     }
+    }
+bakery:
     gLastBakery = now();
     int bx = (L.bakery.x0 + L.bakery.x1) / 2, by = (L.bakery.y0 + L.bakery.y1) / 2;
     std::map<std::string, BakeryLine> bake;
@@ -978,6 +1150,11 @@ static void fullScan() {
         nap(gBrain.settleMs);
     }
     safeWheel(bx, by, -80);
+    if (!store) {
+        if (!bake.empty()) gBakery = bake;
+        logf("bakery re-read after an upgrade: %d rows", (int)bake.size());
+        return;
+    }
     if (items.empty()) { logf("store unreadable"); gMiss++; return; }
     gItems = items;
     if (!bake.empty()) gBakery = bake;
@@ -1098,7 +1275,10 @@ static bool buy(const Item &target, double predictedGain, const std::string &eff
             gBrain.buyOverhead = 0.8 * gBrain.buyOverhead + 0.2 * std::min(20.0, now() - buyStart);
             // learn what it actually did (only when there's something to learn)
             bool needLearn = cur.research || !gBakery.count(cur.key);
-            if (cur.research) gLastBakery = -1000;
+            if (cur.research) {
+                gLastBakery = -1000;
+                for (auto &kv : gItems) kv.second.tipKind = 0;  // multipliers changed: trust the bakery panel until the next full scan
+            }
             bool clean = now() - gLastBonus > 40;
             if (needLearn && clean && nap(1200) && readEconNow()) {
                 double dP = prodNow(gEcon) - P0;
@@ -1141,7 +1321,7 @@ static std::string fmtDur(double s) {
 static void renderHud() {
     double k = 1.0;
     if (gHwnd) { UINT d = GetDpiForWindow(gHwnd); if (d) k = d / 96.0 * 0.9; }
-    int W = (int)(470 * k), H = (int)(358 * k);
+    int W = (int)(470 * k), H = (int)(412 * k);
     std::string state, task, want, wantType, why;
     double wantCost, wantGain; long long clicks; int buysRun, bonusRun;
     std::vector<std::pair<std::string, double>> alts;
@@ -1152,6 +1332,9 @@ static void renderHud() {
         wantCost = gHud.wantCost; wantGain = gHud.wantGain; clicks = gHud.clicks; buysRun = gHud.buysRun; bonusRun = gHud.bonusRun;
         alts = gHud.alts; lines = gHud.lines;
     }
+    std::string order; { std::lock_guard<std::mutex> lk(gHud.mu); order = gHud.order; }
+    std::string ptext, reply; bool popen = gPromptOpen; double replyAt;
+    { std::lock_guard<std::mutex> lk(gPromptMu); ptext = gPromptText; reply = gReply; replyAt = gReplyAt; }
     if (gPaused) state = "PAUSED";
     if (!gPaused && now() < gResumeAt) { char b[64]; snprintf(b, sizeof b, "Starting in %.1fs - hands off the mouse", gResumeAt - now()); task = b; }
     double bank = gEconTime > 0 ? bankNow() : 0, P = prodNow(gEcon);
@@ -1176,6 +1359,15 @@ static void renderHud() {
             if (fill) cv.blend(x, y, 70, 160, 255, 0.95f); else cv.blend(x, y, 40, 60, 100, 0.6f);
         }
     for (int x = (int)(16 * k); x < W - (int)(16 * k); x++) { cv.blend(x, (int)(204 * k), 70, 110, 180, 0.6f); cv.blend(x, (int)(282 * k), 70, 110, 180, 0.6f); }
+    {
+        int bx0 = (int)(14 * k), bx1 = W - (int)(14 * k), by0 = (int)(366 * k), by1 = (int)(398 * k);
+        float glow = popen ? 0.95f : 0.45f;
+        for (int y = by0; y < by1; y++)
+            for (int x = bx0; x < bx1; x++) {
+                bool edge = y < by0 + (int)(1.5 * k) || y >= by1 - (int)(1.5 * k) || x < bx0 + (int)(1.5 * k) || x >= bx1 - (int)(1.5 * k);
+                if (edge) cv.blend(x, y, 90, 170, 255, glow); else cv.blend(x, y, 14, 30, 64, popen ? 0.95f : 0.7f);
+            }
+    }
 
     // text layer (grayscale-antialiased, colour comes from the text itself)
     HDC dc = CreateCompatibleDC(nullptr);
@@ -1222,7 +1414,7 @@ static void renderHud() {
         auto cd = [&](double t) { return t <= 0.5 ? std::string("now") : fmtDur(t); };
         std::string nx;
         if (!want.empty() && cfgBuy) nx += "buy " + cd(bank >= wantCost ? 0 : (wantCost - bank) / std::max(1.0, P)) + "  \xC2\xB7  ";
-        if (cfgBuy) nx += "store " + cd(gLastFull + 600 - now()) + "  \xC2\xB7  bakery " + cd(gLastBakery + 300 - now()) + "  \xC2\xB7  ";
+        if (cfgBuy) nx += "store " + cd(gLastFull + 3600 - now()) + "  \xC2\xB7  ";
         nx += "count " + cd(gEconTime + 15 - now()) + "  \xC2\xB7  captcha " + cd(gLastScreenCheck + 15 - now());
         text(fSmall, white, 86, 171, nx);
     }
@@ -1238,7 +1430,16 @@ static void renderHud() {
     stat(2, 2, "Learned", std::to_string(gBrain.corr.size() + gBrain.growth.size() + gBrain.unitCps.size()));
     text(fLabel, lab, 18, 290, "THOUGHTS");
     int y = 306;
-    for (auto &l : lines) { text(fSmall, dim, 18, y, l); y += 15; if (y > 356) break; }
+    for (auto &l : lines) { text(fSmall, dim, 18, y, l); y += 15; if (y > 342) break; }
+    {
+        std::string row;
+        COLORREF col = dim;
+        if (popen) { row = "> " + ptext + (std::fmod(now(), 1.0) < 0.55 ? "_" : " "); col = white; }
+        else if (now() - replyAt < 6 && !reply.empty()) { row = reply; col = cyan; }
+        else if (!order.empty()) { row = "ORDER  " + order; col = cyan; }
+        else row = "type to give an order  (e.g. \"buy 10 grandmas\")";
+        text(fBody, col, 26, 373, row, 420);
+    }
 
     GdiFlush();
     const uint32_t *tp = (const uint32_t *)bits;
@@ -1253,11 +1454,14 @@ static void renderHud() {
     SelectObject(dc, oldB);
     for (HFONT f : {fTitle, fBody, fBold, fSmall, fLabel}) DeleteObject(f);
     DeleteObject(bmp); DeleteDC(dc);
-    pushLayered(gHudWnd, gMon.left + (int)(26 * k), gMon.bottom - H - (int)(26 * k), W, H, bg.data());
+    RECT wa = gWork.right > gWork.left ? gWork : gMon;
+    int hx = wa.left + (gHudDX >= 0 ? gHudDX : (int)(26 * k)), hy = wa.bottom - H - (gHudDY >= 0 ? gHudDY : (int)(26 * k));
+    hx = std::max((int)wa.left, std::min((int)wa.right - W, hx)); hy = std::max((int)wa.top, std::min((int)wa.bottom - H, hy));
+    pushLayered(gHudWnd, hx, hy, W, H, bg.data(), gHudDrag);
 }
 
 // ================= control panel window =================
-enum { ID_PAUSE = 101, ID_QUIT, ID_BUY, ID_GOLD, ID_FX, ID_HOURS, ID_CPS, ID_APPLY, ID_FORGET, ID_LOG, ID_STATUS, ID_STATS };
+enum { ID_PAUSE = 101, ID_QUIT, ID_BUY, ID_GOLD, ID_FX, ID_HOURS, ID_CPS, ID_APPLY, ID_FORGET, ID_LOG, ID_STATUS, ID_STATS, ID_UPDATE };
 static HWND gPanel = nullptr;
 static std::atomic<bool> gForgetReq{false};
 static HBRUSH gBrBg, gBrEdit;
@@ -1312,7 +1516,8 @@ static LRESULT CALLBACK panelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         mk(L"BUTTON", L"Apply", BS_OWNERDRAW, 360, 152, 76, 30, ID_APPLY);
         mk(L"STATIC", L"", SS_LEFT, 16, 194, 420, 58, ID_STATS);
         mk(L"LISTBOX", L"", LBS_NOINTEGRALHEIGHT | WS_VSCROLL | LBS_NOSEL, 16, 258, 420, 250, ID_LOG);
-        mk(L"BUTTON", L"Forget everything it learned", BS_OWNERDRAW, 16, 516, 420, 30, ID_FORGET);
+        mk(L"BUTTON", L"Forget what it learned", BS_OWNERDRAW, 16, 516, 205, 30, ID_FORGET);
+        mk(L"BUTTON", L"Check for updates", BS_OWNERDRAW, 231, 516, 205, 30, ID_UPDATE);
         SetTimer(h, 1, 250, nullptr);
         return 0;
     }
@@ -1340,7 +1545,7 @@ static LRESULT CALLBACK panelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         } else if (id == ID_FORGET) {
             if (MessageBoxW(h, L"Wipe everything the bot has learned and start its brain from scratch?", L"CookieBot", MB_YESNO | MB_ICONQUESTION) == IDYES)
                 gForgetReq = true;
-        }
+        } else if (id == ID_UPDATE) { gUpdateCheckReq = true; logf("Checking GitHub for updates..."); }
         InvalidateRect(GetDlgItem(h, id), nullptr, TRUE);
         return 0;
     }
@@ -1390,7 +1595,8 @@ static void panelThread() {
     RegisterClassW(&wc);
     RECT r{0, 0, 452, 562};
     AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
-    gPanel = CreateWindowExW(0, L"CookieBotPanel", L"CookieBot AI", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+    wchar_t title[64]; swprintf(title, 64, L"CookieBot AI  v%d", VERSION);
+    gPanel = CreateWindowExW(0, L"CookieBotPanel", title, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                              CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     BOOL dark = TRUE;
     typedef HRESULT(WINAPI * DwmSet)(HWND, DWORD, LPCVOID, DWORD);
@@ -1411,9 +1617,90 @@ static void clickFor(double seconds) {
     }
     double end = now() + seconds, nextSpawn = now();
     while (now() < end && canAct()) {
+        { std::lock_guard<std::mutex> lk(gPromptMu); if (!gCmds.empty()) break; }
         if (cfgGolden && now() >= nextSpawn) { clickSpawned(); nextSpawn = now() + 0.4; }
         if (!safeClick(L.cookieX + (rand() % 11 - 5), L.cookieY + (rand() % 11 - 5))) break;
     }
+}
+
+// ================= prompt bar orders =================
+static void reply(const char *fmt, ...) {
+    char buf[256];
+    va_list a; va_start(a, fmt); vsnprintf(buf, sizeof buf, fmt, a); va_end(a);
+    { std::lock_guard<std::mutex> lk(gPromptMu); gReply = buf; gReplyAt = now(); }
+    logf("order: %s", buf);
+}
+
+static void updateGoalHud() {
+    std::string o;
+    if (gGoal.on) {
+        auto f = gItems.find(gGoal.key);
+        int have = f != gItems.end() ? f->second.owned : gGoal.start;
+        char b[160];
+        if (gGoal.key.rfind("R:", 0) == 0) snprintf(b, sizeof b, "buy %s", gGoal.name.c_str());
+        else snprintf(b, sizeof b, "buy %d %s  -  %d / %d", gGoal.target - gGoal.start, gGoal.name.c_str(), std::max(0, have - gGoal.start), gGoal.target - gGoal.start);
+        o = b;
+    }
+    std::lock_guard<std::mutex> lk(gHud.mu); gHud.order = o;
+}
+
+static void checkGoal() {
+    if (!gGoal.on) return;
+    auto f = gItems.find(gGoal.key);
+    bool research = gGoal.key.rfind("R:", 0) == 0;
+    if ((research && f == gItems.end()) || (!research && f != gItems.end() && f->second.owned >= gGoal.target)) {
+        gGoal.on = false;
+        reply("done: %s - back to normal play", gGoal.name.c_str());
+    }
+    updateGoalHud();
+}
+
+static void processCmds() {
+    std::deque<std::string> q;
+    { std::lock_guard<std::mutex> lk(gPromptMu); q.swap(gCmds); }
+    for (auto &c : q) {
+        logf("you typed: \"%s\"", c.c_str());
+        std::vector<std::pair<std::string, std::string>> names;
+        for (auto &kv : gItems) names.push_back({kv.first, kv.second.name});
+        Order o = parseOrder(c, names);
+        switch (o.kind) {
+        case O_BUY: {
+            auto &it = gItems[o.key];
+            gGoal = Goal{};
+            gGoal.on = true; gGoal.key = o.key; gGoal.name = o.name; gGoal.since = now();
+            gGoal.start = std::max(0, it.owned);
+            gGoal.target = gGoal.start + (it.research ? 1 : o.count);
+            gBlack.erase(o.key);
+            gBuyPauseUntil = 0;
+            if (it.research) reply("on it: saving up for %s", o.name.c_str());
+            else reply("on it: buying %d %s (%d -> %d)", o.count, o.name.c_str(), gGoal.start, gGoal.target);
+            break;
+        }
+        case O_CANCEL:
+            if (gGoal.on) { reply("cancelled: %s - back to normal play", gGoal.name.c_str()); gGoal.on = false; }
+            else reply("nothing to cancel");
+            break;
+        case O_SKIP: gBlack[o.key] = now() + 1e9; reply("won't buy %s (say \"allow %s\" to undo)", o.name.c_str(), o.name.c_str()); break;
+        case O_UNSKIP: gBlack.erase(o.key); reply("%s is allowed again", o.name.c_str()); break;
+        case O_PAUSE: gPaused = true; reply("paused - F8 to resume"); break;
+        case O_BUYON: cfgBuy = true; reply("buying turned on"); break;
+        case O_BUYOFF: cfgBuy = false; reply("buying turned off - just clicking"); break;
+        case O_GOLDON: cfgGolden = true; reply("clicking bonus cookies"); break;
+        case O_GOLDOFF: cfgGolden = false; reply("ignoring bonus cookies"); break;
+        case O_FXON: cfgFx = true; reply("effects + HUD on"); break;
+        case O_FXOFF: cfgFx = false; reply("effects + HUD off"); break;
+        case O_CPS: cfgCps = std::max(1.0, std::min(12.0, o.val)); reply("clicking at %.1f/s", cfgCps); break;
+        case O_HOURS: cfgHours = std::max(0.25, std::min(72.0, o.val)); reply("planning for %.1f h sessions", cfgHours); break;
+        case O_RESCAN: gLastFull = -1000; gLastBakery = -1000; reply("rescanning the store and bakery"); break;
+        case O_UPDATE: gUpdateCheckReq = true; reply("checking GitHub for updates"); break;
+        case O_HELP: reply("try: buy 10 grandmas / skip bakery / cancel / bonus off / clicks 8 / rescan / pause"); break;
+        default:
+            if (gItems.empty()) reply("haven't read the store yet - try again in a bit");
+            else reply("didn't get that - type \"help\"");
+        }
+        if (gPanel) InvalidateRect(gPanel, nullptr, TRUE);
+    }
+    updateGoalHud();
 }
 
 // ================= self-update from GitHub =================
@@ -1447,11 +1734,11 @@ static bool httpGet(const std::string &url, std::string &out, size_t maxBytes) {
     return ok;
 }
 
-static bool checkUpdate() {
+static bool checkUpdate(bool manual) {
     std::string v;
-    if (!httpGet(std::string(REPO_RAW) + "version.txt", v, 64)) return false;
+    if (!httpGet(std::string(REPO_RAW) + "version.txt", v, 64)) { if (manual) logf("couldn't reach GitHub to check for updates"); return false; }
     int remote = atoi(v.c_str());
-    if (remote <= VERSION) return false;
+    if (remote <= VERSION) { if (manual) logf("already up to date (v%d)", VERSION); return false; }
     logf("update found: v%d -> v%d, downloading", VERSION, remote);
     std::string exe;
     if (!httpGet(std::string(REPO_RAW) + "CookieBot.ex_", exe, 64u << 20) || exe.size() < 100000 || exe.compare(0, 2, "MZ") != 0) {
@@ -1470,8 +1757,9 @@ static bool checkUpdate() {
 
 static void updateThread() {
     for (;;) {
-        if (checkUpdate()) { gUpdateReady = true; gQuit = true; return; }
-        for (int i = 0; i < 3600 && !gQuit; i++) Sleep(1000);
+        bool manual = gUpdateCheckReq.exchange(false);
+        if (checkUpdate(manual)) { gUpdateReady = true; gQuit = true; return; }
+        for (int i = 0; i < 3600 && !gQuit && !gUpdateCheckReq; i++) Sleep(1000);
         if (gQuit) return;
     }
 }
@@ -1530,7 +1818,7 @@ int main(int argc, char **argv) {
     setTask("Starting in 3 s - hands off the mouse");
     {
         HMONITOR m = MonitorFromWindow(gHwnd, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO mi{sizeof mi}; GetMonitorInfo(m, &mi); gMon = mi.rcMonitor;
+        MONITORINFO mi{sizeof mi}; GetMonitorInfo(m, &mi); gMon = mi.rcMonitor; gWork = mi.rcWork;
     }
     gResumeAt = now() + 3;
     std::thread(overlayThread).detach();
@@ -1551,6 +1839,8 @@ int main(int argc, char **argv) {
     double lastStatus = 0;
     std::string lastPlan;
     while (!gQuit) {
+        processCmds();
+        checkGoal();
         if (gForgetReq) { gBrain = Brain(); DeleteFileA(BRAIN); gForgetReq = false; logf("Brain wiped - starting from base training"); }
         if (gPaused || now() < gResumeAt) {
             gOverlayOn = false; wasPaused = true;
@@ -1565,7 +1855,7 @@ int main(int argc, char **argv) {
             Sleep(500); continue;
         }
         HMONITOR m = MonitorFromWindow(gHwnd, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO mi{sizeof mi}; GetMonitorInfo(m, &mi); gMon = mi.rcMonitor;
+        MONITORINFO mi{sizeof mi}; GetMonitorInfo(m, &mi); gMon = mi.rcMonitor; gWork = mi.rcWork;
 
         if (!gameTitleOk()) {
             gOverlayOn = false;
@@ -1593,23 +1883,44 @@ int main(int argc, char **argv) {
 
         screenGuard();
         if (gQuit || gPaused || !L.ok) continue;
-        if (cfgBuy && now() - gLastFull > 600) fullScan();
+        if ((cfgBuy || gGoal.on) && now() - gLastFull > 3600) fullScan();
+        else if ((cfgBuy || gGoal.on) && gLastBakery < 0 && !gItems.empty()) fullScan(false);
         else if (now() - gEconTime > 15) { if (!readEconNow()) gMiss++; }
         if (gQuit || gPaused || !L.ok) continue;
 
         double clickSecs = 2.0;
-        if (cfgBuy && !gItems.empty() && now() > gBuyPauseUntil) {
+        if ((cfgBuy || gGoal.on) && !gItems.empty() && (now() > gBuyPauseUntil || gGoal.on)) {
             std::vector<Item> list;
             SimState s = currentState(list);
             double sess = cfgHours * 3600;
             double left = std::max(1200.0, sess - fmod(now() - gStart, sess));
             Plan p = plan(list, s, gBrain, left);
+            bool goalBlocked = false;
+            if (gGoal.on) {
+                int gi = -1;
+                for (size_t i = 0; i < list.size(); i++) if (list[i].key == gGoal.key) gi = (int)i;
+                if (gi >= 0) {
+                    p.first = gi;
+                    p.gain = s.unit.count(gGoal.key) ? s.unit[gGoal.key] : 0;
+                    p.wait = std::max(0.0, (list[gi].cost - s.bank) / std::max(1.0, s.P()));
+                    p.effType = "your order";
+                    p.why = "order: " + gGoal.name;
+                } else { p.first = -1; goalBlocked = true; }
+            }
+            if (p.first >= 0) {
+                const Item &nt = list[p.first];
+                if (nt.nx && gStoreScroll == nt.scroll) setNext(true, nt.nx, nt.ny, 0);
+                else {
+                    int dir = (gStoreScroll < 0 || nt.scroll < gStoreScroll) ? -1 : 1;
+                    setNext(true, (L.store.x0 + L.store.x1) / 2, dir < 0 ? L.store.y0 + 50 : L.store.y1 - 50, dir);
+                }
+            } else setNext(false);
             {
                 std::lock_guard<std::mutex> lk(gHud.mu);
                 gHud.alts = p.alts;
                 if (p.first >= 0) {
                     gHud.want = list[p.first].name; gHud.wantCost = list[p.first].cost; gHud.wantGain = p.gain; gHud.wantType = p.effType;
-                    gHud.why.clear();
+                    gHud.why = gGoal.on ? p.why : "";
                 } else { gHud.want.clear(); gHud.wantCost = 0; gHud.wantGain = 0; gHud.why = "nothing pays off before the session ends"; }
             }
             if (p.first >= 0) {
@@ -1621,8 +1932,8 @@ int main(int argc, char **argv) {
                     setTask("Buying %s", list[p.first].name.c_str());
                     if (buy(list[p.first], p.gain, e.type())) continue;
                 } else clickSecs = std::max(2.0, std::min(10.0, p.wait - 0.5));
-            } else clickSecs = 10.0;
-        }
+            } else clickSecs = goalBlocked ? 5.0 : 10.0;
+        } else setNext(false);
         clickFor(clickSecs);
     }
     gOverlayOn = false;

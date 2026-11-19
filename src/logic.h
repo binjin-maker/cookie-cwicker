@@ -272,6 +272,8 @@ struct Item {
     int scroll = 0;  // wheel notches from top where it was seen
     int descY = 0;
     int nx = 0, ny = 0, px = 0, py = 0;  // name / price positions on screen
+    double tip = -1;  // exact per-unit value from the hover tooltip
+    int tipKind = 0;  // 1 = cookies/sec, 2 = cookies per click
 };
 
 static inline std::vector<Item> parseStore(const std::vector<Seg> &segs, const Rect &r, int scroll) {
@@ -391,10 +393,121 @@ static inline std::vector<BakeryLine> parseBakery(const std::vector<Seg> &segs, 
     return out;
 }
 
+
+// hover tooltip: "each grandma makes 68.5 cookies per second" / "each mini clicker adds 16 cookies to every click"
+static inline bool parseTip(const std::vector<Seg> &segs, const std::string &itemName, double &val, int &kind) {
+    std::vector<const Seg *> v;
+    for (auto &s : segs) v.push_back(&s);
+    std::sort(v.begin(), v.end(), [](const Seg *a, const Seg *b) {
+        if (std::abs(a->cy() - b->cy()) > std::min(a->h, b->h) / 2) return a->cy() < b->cy();
+        return a->x < b->x;
+    });
+    std::string all;
+    for (auto s : v) all += lower(s->text) + " ";
+    std::string want = lettersOnly(lower(itemName));
+    if (want.size() > 5) want = want.substr(0, 5);
+    size_t pos = 0;
+    while ((pos = all.find("each ", pos)) != std::string::npos) {
+        size_t verb = std::string::npos, vlen = 0;
+        for (const char *w : {" makes ", " adds ", " make ", " add "}) {
+            size_t f = all.find(w, pos);
+            if (f != std::string::npos && f - pos < 60 && f < verb) { verb = f; vlen = strlen(w); }
+        }
+        if (verb == std::string::npos) { pos += 5; continue; }
+        std::string who = lettersOnly(all.substr(pos + 5, verb - pos - 5));
+        size_t ck = all.find("cookie", verb);
+        if (ck == std::string::npos || ck - verb > 40 || who.compare(0, want.size(), want) != 0) { pos += 5; continue; }
+        double x;
+        if (!findAmount(all.substr(verb + vlen, ck - verb - vlen), x) || x <= 0) { pos += 5; continue; }
+        std::string after = all.substr(ck, 40);
+        kind = after.find("click") != std::string::npos ? 2 : 1;
+        val = x;
+        return true;
+    }
+    return false;
+}
+
 static inline int prefixMatch(const std::string &a, const std::string &b) {
     size_t n = 0;
     while (n < a.size() && n < b.size() && a[n] == b[n]) n++;
     return (int)n;
+}
+
+
+// ================= typed orders from the prompt bar =================
+enum OrdKind { O_NONE, O_BUY, O_CANCEL, O_PAUSE, O_BUYON, O_BUYOFF, O_GOLDON, O_GOLDOFF, O_FXON, O_FXOFF,
+               O_CPS, O_HOURS, O_RESCAN, O_UPDATE, O_SKIP, O_UNSKIP, O_HELP };
+struct Order { OrdKind kind = O_NONE; std::string key, name; int count = 1; double val = 0; };
+
+static inline bool hasWord(const std::string &t, const char *w) {
+    std::string s = " " + t + " ", k = std::string(" ") + w;
+    size_t f = s.find(k);
+    while (f != std::string::npos) {
+        char c = s[f + k.size()];
+        if (!isalpha((unsigned char)c)) return true;
+        f = s.find(k, f + 1);
+    }
+    return false;
+}
+
+static inline Order parseOrder(const std::string &raw, const std::vector<std::pair<std::string, std::string>> &items) {
+    Order o;
+    std::string t = lower(raw);
+    for (auto &c : t) if (!isalnum((unsigned char)c) && c != '.') c = ' ';
+    double num = -1;
+    {
+        static const char *words[] = {"zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+                                      "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty"};
+        for (auto &tk : split(t)) {
+            if (isdigit((unsigned char)tk[0])) { num = atof(tk.c_str()); break; }
+            for (int i = 0; i <= 20; i++) if (tk == words[i]) { num = i; break; }
+            if (num >= 0) break;
+        }
+        if (num < 0 && (hasWord(t, "a") || hasWord(t, "an") || hasWord(t, "another"))) num = 1;
+    }
+    bool off = hasWord(t, "off") || hasWord(t, "stop") || hasWord(t, "no") || hasWord(t, "dont") || hasWord(t, "don") ||
+               hasWord(t, "disable") || hasWord(t, "hide") || hasWord(t, "never");
+    bool on = hasWord(t, "on") || hasWord(t, "start") || hasWord(t, "enable") || hasWord(t, "show") || hasWord(t, "resume");
+
+    // best item match: longest name (or its singular) that appears in the text
+    std::string tl = lettersOnly(t);
+    size_t best = 0;
+    for (auto &it : items) {
+        std::string n = lettersOnly(lower(it.second));
+        std::vector<std::pair<std::string, int>> forms{{n, 3}};
+        if (n.size() > 4 && n.back() == 's') forms.push_back({n.substr(0, n.size() - 1), 3});
+        if (n.size() > 5 && n.back() == 'y') forms.push_back({n.substr(0, n.size() - 1), 3});
+        auto ws = split(lower(it.second));
+        if (ws.size() > 1 && lettersOnly(ws.back()).size() >= 5) forms.push_back({lettersOnly(ws.back()), 1});
+        int bonus = it.first.rfind("B:", 0) == 0 ? 1 : 0;
+        for (auto &f : forms) {
+            size_t sc = f.first.size() * f.second * 2 + bonus;
+            if (f.first.size() >= 4 && tl.find(f.first) != std::string::npos && sc > best) { best = sc; o.key = it.first; o.name = it.second; }
+        }
+    }
+
+    if (hasWord(t, "help") || t.find("what can") != std::string::npos) { o.kind = O_HELP; return o; }
+    if (hasWord(t, "cancel") || hasWord(t, "nevermind") || hasWord(t, "forget it") || t.find("never mind") != std::string::npos ||
+        (hasWord(t, "clear") && o.key.empty())) { o.kind = O_CANCEL; return o; }
+    if (hasWord(t, "update") || hasWord(t, "updates")) { o.kind = O_UPDATE; return o; }
+    if (hasWord(t, "pause")) { o.kind = O_PAUSE; return o; }
+    if (hasWord(t, "rescan") || hasWord(t, "scan") || hasWord(t, "reread") || (hasWord(t, "refresh") && hasWord(t, "store"))) { o.kind = O_RESCAN; return o; }
+    if (hasWord(t, "golden") || hasWord(t, "bonus")) { o.kind = off ? O_GOLDOFF : O_GOLDON; return o; }
+    if (hasWord(t, "hud") || hasWord(t, "effects") || hasWord(t, "fx") || hasWord(t, "vignette")) { o.kind = off ? O_FXOFF : O_FXON; return o; }
+    if ((hasWord(t, "cps") || hasWord(t, "clicks") || t.find("click speed") != std::string::npos || hasWord(t, "speed")) && num > 0 && o.key.empty()) {
+        o.kind = O_CPS; o.val = num; return o;
+    }
+    if ((hasWord(t, "hours") || hasWord(t, "hour") || hasWord(t, "session")) && num > 0) { o.kind = O_HOURS; o.val = num; return o; }
+    if (!o.key.empty()) {
+        if (hasWord(t, "skip") || hasWord(t, "ignore") || hasWord(t, "avoid") || (off && (hasWord(t, "buy") || hasWord(t, "buying")))) { o.kind = O_SKIP; return o; }
+        if (hasWord(t, "unskip") || hasWord(t, "allow")) { o.kind = O_UNSKIP; return o; }
+        o.kind = O_BUY; o.count = num >= 1 ? std::min(500, (int)num) : 1; return o;
+    }
+    if (hasWord(t, "buying") || hasWord(t, "buy") || hasWord(t, "upgrades") || hasWord(t, "purchases")) {
+        if (off) { o.kind = O_BUYOFF; return o; }
+        if (on || hasWord(t, "buying")) { o.kind = O_BUYON; return o; }
+    }
+    return o;
 }
 
 // ================= BRAIN: everything it learns, saved between runs =================
@@ -664,6 +777,15 @@ static inline SimState makeState(const Econ &e, const std::vector<BakeryLine> &b
     for (auto &b : bl) {
         s.unit[b.key] = b.rate / b.count; s.total[b.key] = b.rate; s.owned[b.key] = b.count; sum += b.rate;
     }
+    bool anyTip = false;
+    for (auto &it : items) {
+        if (it.research || it.tipKind == 0) continue;
+        anyTip = true;
+        double u = it.tipKind == 2 ? it.tip * rate : it.tip;
+        sum -= s.total.count(it.key) ? s.total[it.key] : 0;
+        s.unit[it.key] = u;
+        if (it.owned > 0) { s.total[it.key] = u * it.owned; s.owned[it.key] = it.owned; sum += u * it.owned; }
+    }
     std::vector<const Item *> missing;
     for (auto &it : items) if (!it.research && it.owned > 0 && !s.unit.count(it.key)) missing.push_back(&it);
     double leftover = s.cps - sum;
@@ -685,7 +807,7 @@ static inline SimState makeState(const Econ &e, const std::vector<BakeryLine> &b
         auto f = s.total.find(it.key);
         if (f == s.total.end() || f->second <= 0) allKnown = false; else tot += f->second;
     }
-    if (allKnown && tot > 0 && s.cps > 0) {
+    if (!anyTip && allKnown && tot > 0 && s.cps > 0) {
         double r = s.cps / tot;
         if (r > 1.5 || r < 0.67) {
             s.fix = r;
@@ -694,6 +816,7 @@ static inline SimState makeState(const Econ &e, const std::vector<BakeryLine> &b
         }
     }
     for (auto &b : bl) B.learnUnit(b.key, s.unit[b.key]);
+    for (auto &it : items) if (!it.research && it.tipKind) B.learnUnit(it.key, s.unit[it.key]);
     // never-seen buildings: estimate from the efficiency of the priciest known one
     double bestCost = 0, eff = 0;
     for (auto &it : items) {

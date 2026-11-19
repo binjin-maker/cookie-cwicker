@@ -20,6 +20,7 @@ CONTENTS
   14. How to rebuild the exe
   15. Troubleshooting
   16. Auto-update
+  17. Prompt bar (typed orders)
 
 
 --------------------------------------------------------------------
@@ -69,8 +70,9 @@ CONTENTS
   - Stats: cookies, per sec, per click, purchases (run / all-time),
     uptime, how much the brain has learned.
   - Live log (last 300 lines).
-  - "Forget everything it learned": wipes the brain back to its
-    base training (asks first).
+  - "Forget what it learned": wipes the brain back to its base
+    training (asks first).
+  - "Check for updates": checks GitHub right now (section 16).
   Moving the mouse to the panel pauses the bot, so the button will
   say Resume. Pressing it switches back to the game, and you get
   2.5 s to let go.
@@ -93,7 +95,18 @@ CONTENTS
             count check, captcha/popup check
   STATS     cookies, per sec, per click, clicks, bought, bonus,
             uptime, real clicks/s, learned
-  THOUGHTS  last 4 log lines
+  THOUGHTS  last 3 log lines
+  PROMPT    the typing bar (section 17), your current order, or the
+            bot's answer to what you typed
+
+  The HUD sits above the taskbar. To move it: touch the mouse (the
+  bot pauses), drag the HUD wherever you want, then F8 to resume.
+  The spot is saved in cookiebot_hud.txt.
+
+  Dotted path: a marching dotted line shows where the cursor is
+  going. While it glides it traces the exact curve; while clicking
+  the cookie it points at the store card it's saving for (with
+  arrows if that card is scrolled off screen).
 
   Plus a blue vignette around the screen edges and a spinning ring
   around the cursor that bursts on each click (bigger burst for bonus
@@ -113,10 +126,16 @@ CONTENTS
       footer. Builds rectangles for the left panel, the bakery, the
       store and the overall game area. Finds the big cookie by color.
    3. Every 15 s: screen check for a captcha (wait) or popup (close).
-   4. Every 10 min: full scan. Scrolls the whole store, reading
-      every item (name, price, owned count, research description).
-      Every 5 min (or right after a research buy) it also scrolls the
-      bakery panel and reads each building's total /sec.
+   4. Prices only change when something is bought, so the whole
+      store is only scanned at start and then once an hour (to catch
+      newly unlocked items). Each scan reads every item (name, price,
+      owned count, research description) and hovers each building to
+      read its tooltip ("each grandma makes 68.5 cookies per second",
+      "each mini clicker adds 16 cookies to every click"), which gives
+      exact values. It also reads the bakery panel.
+      After every buy it re-reads just that store page and keeps the
+      new prices in memory. After a research buy it re-reads the
+      bakery panel only (multipliers changed).
       Every 15 s otherwise: re-reads the cookie count only.
    5. Runs the planner on its saved prices. If it can afford the
       best plan, it buys. Otherwise it clicks the cookie until about
@@ -281,6 +300,7 @@ CONTENTS
                         page and buy attempt. Wiped at each start.
                         Send this when something's wrong.
   cookiebot_brain.txt   what it has learned (section 7)
+  cookiebot_hud.txt     where you dragged the HUD to
   CookieBot.exe.old /.new   leftovers from an update, deleted on start
 
 
@@ -351,13 +371,13 @@ CONTENTS
     Under 25 px it jumps instead of gliding.
 
   TIMERS (main loop in main() unless noted)
-  - Full store rescan:    "now() - gLastFull > 600"     (seconds)
+  - Full store rescan:    "now() - gLastFull > 3600"    (seconds)
   - Cookie count re-read: "now() - gEconTime > 15"
   - Bakery rescan:        fullScan(): "now() - gLastBakery < 300"
   - Captcha/popup check:  screenGuard(): "< 15"
     (also update the matching numbers in renderHud's NEXT row:
-     "gLastFull + 600", "gLastBakery + 300", "gEconTime + 15",
-     "gLastScreenCheck + 15")
+     "gLastFull + 3600", "gEconTime + 15", "gLastScreenCheck + 15")
+  - Tooltip wait after hovering: readTip(): "nap(280)"
   - Refresh interval when the game won't load: connectionWatch():
         "now() - gLastRefresh < 10"
   - Bonus cookie check while clicking: clickFor(): "nextSpawn = now() + 0.4"
@@ -487,7 +507,8 @@ CONTENTS
 --------------------------------------------------------------------
 16. AUTO-UPDATE
 --------------------------------------------------------------------
-  At startup and every hour it reads version.txt from
+  At startup, every hour, and when you press "Check for updates"
+  (or type "update"), it reads version.txt from
   github.com/binjin-maker/cookie-cwicker (main branch). If that number
   is higher than its own VERSION, it downloads CookieBot.ex_ from the
   repo, saves the brain, swaps itself out and restarts with the same
@@ -498,3 +519,33 @@ CONTENTS
    1. Bump "static const int VERSION = N;" at the top of main.cpp.
    2. Rebuild, rename to CookieBot.ex_.
    3. Put N in version.txt and push both to main.
+
+
+--------------------------------------------------------------------
+17. PROMPT BAR (TYPED ORDERS)
+--------------------------------------------------------------------
+  While the bot is running, just start typing a letter. Keys go into
+  the prompt bar at the bottom of the HUD instead of the game. Enter
+  sends it, Esc closes it, Backspace edits. It closes on its own
+  after 30 s of no typing. It doesn't chat back - it just does it,
+  and shows a one-line note of what it did.
+
+  Things it understands (wording is loose):
+    buy 10 grandmas / save up for a dough portal / get 2 bakeries
+        -> becomes its goal. It saves up and buys only that until
+           done, then goes back to normal play. Works for research
+           too. Number words (one..twenty) work.
+    cancel / nevermind          drop the current order
+    skip bakery / don't buy X   never buy that ("allow X" undoes it)
+    stop buying / start buying  turn buying off / on
+    bonus off / bonus on        bonus cookie clicking
+    hide hud / show hud         effects + HUD
+    clicks 8                    clicks per second (1-12)
+    6 hour session              planning window
+    rescan                      re-read the store and bakery now
+    update                      check GitHub for a new version
+    pause                       pause (F8 to resume)
+    help                        list of examples
+
+  Code: parseOrder() in logic.h (testable on Linux), processCmds()
+  and checkGoal() in main.cpp, keyHook() for the typing.
