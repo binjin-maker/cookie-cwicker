@@ -31,7 +31,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 5;
+static const int VERSION = 6;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -694,7 +694,9 @@ static bool ocrInit() {
     return true;
 }
 
+static std::mutex gOcrMu;
 static std::vector<Word> ocrImage(const Img &im, double scale, int ox, int oy) {
+    std::lock_guard<std::mutex> ocrLock(gOcrMu);
     std::vector<Word> out;
     if (!gOcr || im.w < 8 || im.h < 8) return out;
     UINT32 bytes = (UINT32)(im.w * im.h * 4);
@@ -760,9 +762,10 @@ static void addUnique(std::vector<Word> &dst, const std::vector<Word> &src) {
     }
 }
 
+static thread_local bool tlNoBox = false;
 static std::vector<Word> ocrRect(const Rect &r, double want = 2.0, bool alsoInverted = false) {
     static thread_local int depth = 0;
-    if (depth == 0) { std::lock_guard<std::mutex> lk(gFxMu); gReadRect = r; gReadAt = now(); }
+    if (depth == 0 && !tlNoBox) { std::lock_guard<std::mutex> lk(gFxMu); gReadRect = r; gReadAt = now(); }
     depth++;
     struct Dec { ~Dec() { depth--; } } dec;
     std::vector<Word> out;
@@ -921,7 +924,9 @@ static double bankNow() {
     return gEcon.bank + std::max(0.0, gEcon.cps) * (now() - gEconTime) + std::max(0.0, gEcon.perClick) * (double)(gCookieClicks - gClicksAtRead);
 }
 
-static bool readEconNow() {
+static std::mutex gEconMu;
+static bool readEconNow(bool quiet = false) {
+    std::lock_guard<std::mutex> econLock(gEconMu);
     Rect r = L.left;
     r.y1 = std::min(r.y1, L.cookieY);
     auto segs = segment(ocrRect(r, 2.0));
@@ -934,6 +939,7 @@ static bool readEconNow() {
         else if (zeroish || gEcon.cps <= 0) e.cps = 0;
     }
     if (e.bank < 0 || e.cps < 0) {
+        if (quiet) return false;
         dbgf("--- econ read FAILED:");
         for (auto &sg : segs) dbgf("  seg (%d,%d) '%s'", sg.x, sg.y, sg.text.c_str());
         return false;
@@ -1478,7 +1484,7 @@ static void renderHud() {
         std::string nx;
         if (!want.empty() && cfgBuy) nx += "buy " + cd(bank >= wantCost ? 0 : (wantCost - bank) / std::max(1.0, P)) + "  \xC2\xB7  ";
         if (cfgBuy) nx += "store " + cd(gLastFull + 3600 - now()) + "  \xC2\xB7  ";
-        nx += "count " + cd(gEconTime + 15 - now()) + "  \xC2\xB7  captcha " + cd(gLastScreenCheck + 15 - now());
+        nx += "count " + cd(gEconTime + 1 - now()) + "  \xC2\xB7  captcha " + cd(gLastScreenCheck + 15 - now());
         text(fSmall, white, 86, 171, nx);
     }
     auto stat = [&](int col, int row, const char *label, const std::string &v) {
@@ -1685,6 +1691,18 @@ static void clickFor(double seconds) {
         if (cfgGolden && now() >= nextSpawn) { clickSpawned(); nextSpawn = now() + 0.4; }
         if (!safeClick(L.cookieX + (rand() % 11 - 5), L.cookieY + (rand() % 11 - 5))) break;
         gCookieClicks++;
+    }
+}
+
+// reads the real cookie count every second on its own thread, so clicking never waits for it
+static void econThread() {
+    RoInitialize(RO_INIT_MULTITHREADED);
+    tlNoBox = true;
+    while (!gQuit) {
+        Sleep(250);
+        if (!L.ok || !gOverlayOn || gPaused || now() < gResumeAt || !gameFocused()) continue;
+        if (now() - gEconTime < 1.0) continue;
+        readEconNow(true);
     }
 }
 
@@ -1907,6 +1925,7 @@ int main(int argc, char **argv) {
     gResumeAt = now() + 3;
     std::thread(overlayThread).detach();
     std::thread(inputThread).detach();
+    std::thread(econThread).detach();
     gStart = now();
     {
         Rect top{gMon.left, gMon.top, gMon.right, gMon.top + (gMon.bottom - gMon.top) / 6};

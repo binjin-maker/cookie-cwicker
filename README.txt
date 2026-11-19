@@ -137,7 +137,8 @@ CONTENTS
       After every buy it re-reads just that store page and keeps the
       new prices in memory. After a research buy it re-reads the
       bakery panel only (multipliers changed).
-      Every 15 s otherwise: re-reads the cookie count only.
+      A separate thread re-reads the real cookie count every second
+      (it never holds up clicking) and keeps the last value.
    5. Runs the planner on its saved prices. If it can afford the
       best plan, it buys. Otherwise it clicks the cookie until about
       when it expects to afford it (2-10 s at a time), then re-plans.
