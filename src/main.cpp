@@ -31,7 +31,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 2;
+static const int VERSION = 3;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -869,6 +869,13 @@ static bool readEconNow() {
     r.y1 = std::min(r.y1, L.cookieY);
     auto segs = segment(ocrRect(r, 2.0));
     Econ e = readEcon(segs, L.left);
+    // "0 /sec" in the pixel font often reads as junk ("O @ /"). If the count read fine, fall back to the last cps (or 0).
+    if (e.bank >= 0 && e.cps < 0) {
+        bool zeroish = false;
+        for (auto &sg : segs) { std::string l = lower(sg.text); if (l.find("sec") != std::string::npos || l.find("o @") != std::string::npos) zeroish = true; }
+        if (gEconTime > 0 && now() - gEconTime < 120 && gEcon.cps > 0) e.cps = gEcon.cps;
+        else if (zeroish || gEcon.cps <= 0) e.cps = 0;
+    }
     if (e.bank < 0 || e.cps < 0) {
         dbgf("--- econ read FAILED:");
         for (auto &sg : segs) dbgf("  seg (%d,%d) '%s'", sg.x, sg.y, sg.text.c_str());
