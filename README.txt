@@ -1,5 +1,5 @@
 ====================================================================
- COOKIEBOT AI  -  what it does and how to change it
+ COOKIEBOT  -  what it does and how to change it
  Auto-player for COOKIES FOR U (cookiesforu.netlify.app/game)
 ====================================================================
 
@@ -108,7 +108,8 @@ CONTENTS
   the cookie it points at the store card it's saving for (with
   arrows if that card is scrolled off screen).
 
-  Plus a blue vignette around the screen edges and a spinning ring
+  Plus a green box around whatever it's reading at that moment, a
+  blue vignette around the screen edges and a spinning ring
   around the cursor that bursts on each click (bigger burst for bonus
   cookies). All of it is click-through and excluded from the bot's
   own screenshots, so it never confuses the OCR. On Windows builds
@@ -470,14 +471,18 @@ CONTENTS
 --------------------------------------------------------------------
   On Windows with MSYS2 (mingw-w64):
       pacman -S mingw-w64-x86_64-gcc
-      g++ -O2 -std=c++17 -static -mwindows -o CookieBot.exe main.cpp ^
+      windres cookiebot.rc -O coff -o cookiebot.res
+      g++ -O2 -std=c++17 -static -mwindows -o CookieBot.exe main.cpp cookiebot.res ^
           -lruntimeobject -lwinmm -lole32 -luser32 -lgdi32 -lwininet
 
   Cross-compiling from Linux:
+      x86_64-w64-mingw32-windres cookiebot.rc -O coff -o cookiebot.res
       x86_64-w64-mingw32-g++-posix -O2 -std=c++17 -static -mwindows \
-          -o CookieBot.exe main.cpp \
+          -o CookieBot.exe main.cpp cookiebot.res \
           -lruntimeobject -lwinmm -lole32 -luser32 -lgdi32 -lwininet
 
+  The icon is cookiebot.ico (made by icon_make.py), embedded through
+  cookiebot.rc.
   Drop -mwindows to get a console window back (useful for printf
   debugging). logic.h compiles with any normal g++, so you can unit
   test the parser and planner on Linux/Mac.

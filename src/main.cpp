@@ -31,7 +31,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 3;
+static const int VERSION = 4;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -124,7 +124,9 @@ struct Burst { int x, y; double t; bool big; };
 static std::mutex gFxMu;
 static std::vector<Burst> gBursts;
 static const int FXS = 260;
-static HWND gPath = nullptr;
+static HWND gPath = nullptr, gRead = nullptr;
+static Rect gReadRect{0, 0, 0, 0};
+static double gReadAt = -100;
 static std::atomic<bool> gCapturing{false};
 struct PathT { bool glide = false; int sx = 0, sy = 0, tx = 0, ty = 0; double amp = 0; bool next = false; int nx = 0, ny = 0, dir = 0; };
 static PathT gPathT;
@@ -240,7 +242,12 @@ static void overlayThread() {
     loadHudPos();
     bool hudGrab = false;
     gPath = makeOverlay(L"CookieBotFx", e4);
-    gHiddenFromCapture = e1 && e2 && e3 && e4;
+    bool e5 = false;
+    gRead = makeOverlay(L"CookieBotFx", e5);
+    gHiddenFromCapture = e1 && e2 && e3 && e4 && e5;
+    bool readShown = false;
+    Rect readDrawn{0, 0, 0, 0};
+    std::vector<uint32_t> rbuf;
     bool pathShown = false;
     std::vector<uint32_t> pbuf;
     bool hudShown = false;
@@ -257,7 +264,7 @@ static void overlayThread() {
             if (on) {
                 if (memcmp(&lastMon, &gMon, sizeof(RECT)) != 0) { renderVignette(gMon); lastMon = gMon; }
                 ShowWindow(gVig, SW_SHOWNOACTIVATE); ShowWindow(gFx, SW_SHOWNOACTIVATE);
-            } else { ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gPath, SW_HIDE); pathShown = false; }
+            } else { ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gPath, SW_HIDE); pathShown = false; ShowWindow(gRead, SW_HIDE); readShown = false; }
             shown = on; gVigVisible = on;
         }
         bool hudOn = (cfgFx || gPromptOpen) && gHwnd && gameFocused() && !gQuit;
@@ -343,12 +350,37 @@ static void overlayThread() {
                 pushLayered(gPath, (int)x0, (int)y0, pw, ph, pbuf.data());
                 if (!pathShown) { ShowWindow(gPath, SW_SHOWNOACTIVATE); pathShown = true; }
             } else if (pathShown) { ShowWindow(gPath, SW_HIDE); pathShown = false; }
+
+            // green box around whatever it's reading
+            Rect rr; double rat;
+            { std::lock_guard<std::mutex> lk(gFxMu); rr = gReadRect; rat = gReadAt; }
+            if (now() - rat < 0.8 && rr.x1 > rr.x0 && !gCapturing) {
+                if (memcmp(&rr, &readDrawn, sizeof rr) != 0 || !readShown) {
+                    int m = 4, w = rr.x1 - rr.x0 + 2 * m, hh = rr.y1 - rr.y0 + 2 * m;
+                    rbuf.assign((size_t)w * hh, 0);
+                    int th = 2, cl = std::min(18, std::min(w, hh) / 3);
+                    auto put = [&](int x, int y, float a) {
+                        if (x < 0 || y < 0 || x >= w || y >= hh) return;
+                        uint32_t A = (uint32_t)(a * 255);
+                        rbuf[(size_t)y * w + x] = (A << 24) | ((uint32_t)(a * 60) << 16) | ((uint32_t)(a * 235) << 8) | (uint32_t)(a * 110);
+                    };
+                    for (int x = 0; x < w; x++) for (int t = 0; t < th; t++) { put(x, t, 0.75f); put(x, hh - 1 - t, 0.75f); }
+                    for (int y = 0; y < hh; y++) for (int t = 0; t < th; t++) { put(t, y, 0.75f); put(w - 1 - t, y, 0.75f); }
+                    for (int i = 0; i < cl; i++) for (int t = th; t < th + 2; t++) {
+                        put(i, t, 1); put(t, i, 1); put(w - 1 - i, t, 1); put(w - 1 - t, i, 1);
+                        put(i, hh - 1 - t, 1); put(t, hh - 1 - i, 1); put(w - 1 - i, hh - 1 - t, 1); put(w - 1 - t, hh - 1 - i, 1);
+                    }
+                    pushLayered(gRead, rr.x0 - m, rr.y0 - m, w, hh, rbuf.data());
+                    readDrawn = rr;
+                }
+                if (!readShown) { ShowWindow(gRead, SW_SHOWNOACTIVATE); readShown = true; }
+            } else if (readShown) { ShowWindow(gRead, SW_HIDE); readShown = false; }
             { std::lock_guard<std::mutex> lk(gFxMu);
               gBursts.erase(std::remove_if(gBursts.begin(), gBursts.end(), [](const Burst &b) { return now() - b.t > 1; }), gBursts.end()); }
         }
         Sleep(16);
     }
-    ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gHudWnd, SW_HIDE); ShowWindow(gPath, SW_HIDE);
+    ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gHudWnd, SW_HIDE); ShowWindow(gPath, SW_HIDE); ShowWindow(gRead, SW_HIDE);
 }
 
 // ================= input =================
@@ -518,7 +550,7 @@ static Img grab(const Rect &r, double scale, bool smooth) {
     if (sw <= 0 || sh <= 0) return im;
     bool hide = !gHiddenFromCapture && (gVigVisible || IsWindowVisible(gHudWnd));
     bool hudWas = hide && IsWindowVisible(gHudWnd), vigWas = hide && gVigVisible;
-    if (hide) { gCapturing = true; ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gHudWnd, SW_HIDE); ShowWindow(gPath, SW_HIDE); Sleep(40); }
+    if (hide) { gCapturing = true; ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gHudWnd, SW_HIDE); ShowWindow(gPath, SW_HIDE); ShowWindow(gRead, SW_HIDE); Sleep(40); }
     im.w = std::max(1, (int)(sw * scale)); im.h = std::max(1, (int)(sh * scale));
     HDC scr = GetDC(nullptr), mem = CreateCompatibleDC(scr);
     BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -719,6 +751,10 @@ static void addUnique(std::vector<Word> &dst, const std::vector<Word> &src) {
 }
 
 static std::vector<Word> ocrRect(const Rect &r, double want = 2.0, bool alsoInverted = false) {
+    static thread_local int depth = 0;
+    if (depth == 0) { std::lock_guard<std::mutex> lk(gFxMu); gReadRect = r; gReadAt = now(); }
+    depth++;
+    struct Dec { ~Dec() { depth--; } } dec;
     std::vector<Word> out;
     int sw = r.x1 - r.x0, sh = r.y1 - r.y0;
     if (sw <= 0 || sh <= 0) return out;
@@ -1598,11 +1634,12 @@ static void panelThread() {
     gUiFont = CreateFontW(-15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     gUiBold = CreateFontW(-15, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     WNDCLASSW wc{}; wc.lpfnWndProc = panelProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"CookieBotPanel";
-    wc.hbrBackground = gBrBg; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
+    wc.hbrBackground = gBrBg; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
     RECT r{0, 0, 452, 562};
     AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
-    wchar_t title[64]; swprintf(title, 64, L"CookieBot AI  v%d", VERSION);
+    wchar_t title[64]; swprintf(title, 64, L"CookieBot  v%d", VERSION);
     gPanel = CreateWindowExW(0, L"CookieBotPanel", title, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                              CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     BOOL dark = TRUE;
@@ -1807,7 +1844,7 @@ int main(int argc, char **argv) {
     }
     std::thread(updateThread).detach();
     std::thread(panelThread).detach();
-    logf("CookieBot AI v%d - brain has %d purchases and %d upgrade types learned", VERSION, gBrain.purchases, (int)gBrain.corr.size());
+    logf("CookieBot v%d - brain has %d purchases and %d upgrade types learned", VERSION, gBrain.purchases, (int)gBrain.corr.size());
     if (!ocrInit()) { MessageBoxW(nullptr, L"Windows OCR isn't available. Check cookiebot_log.txt.", L"CookieBot", MB_ICONERROR); return 1; }
     setState("WAITING"); setTask("Click on the game's browser tab to start");
     logf("Click on the browser tab with the game to start.");
