@@ -200,11 +200,12 @@ struct Layout {
 static inline Layout findLayout(const std::vector<Seg> &segs, int scrW, int scrH) {
     Layout L;
     const Seg *store = nullptr, *bake = nullptr, *sell = nullptr, *foot = nullptr, *clickS = nullptr;
-    std::vector<const Seg *> stores, bakes;
+    std::vector<const Seg *> stores, bakes, bakesWeak;
     for (auto &s : segs) {
         std::string l = lower(s.text);
         if (l == "store" || l.rfind("store ", 0) == 0) stores.push_back(&s);
-        if (l.find("your bakery") != std::string::npos) bakes.push_back(&s);
+        if (l.find("your bakery") != std::string::npos || l.find("'s bakery") != std::string::npos || l.find("s bakery") != std::string::npos) bakes.push_back(&s);
+        else if (l.find("bakery") != std::string::npos && l.size() < 24 && l.find("/") == std::string::npos) bakesWeak.push_back(&s);
         if (!foot && (l.find("reset my game") != std::string::npos || l.find("is inspired") != std::string::npos)) foot = &s;
     }
     // the bakery heading sits left of the store heading, on roughly the same row
@@ -215,6 +216,13 @@ static inline Layout findLayout(const std::vector<Seg> &segs, int scrW, int scrH
             int gap = st->x - bk->x;
             if (gap < bestGap) { bestGap = gap; store = st; bake = bk; }
         }
+    if (!store || !bake)
+        for (auto st : stores)
+            for (auto bk : bakesWeak) {
+                if (bk->x >= st->x - 100 || std::abs(bk->cy() - st->cy()) > 80) continue;
+                int gap = st->x - bk->x;
+                if (gap < bestGap) { bestGap = gap; store = st; bake = bk; }
+            }
     if (!store || !bake) return L;
     for (auto &s : segs) {
         std::string l = lower(s.text);

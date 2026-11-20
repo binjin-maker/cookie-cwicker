@@ -31,7 +31,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 11;
+static const int VERSION = 12;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -1146,26 +1146,20 @@ static bool detectLayout() {
     Rect mon{gMon.left, gMon.top, gMon.right, gMon.bottom};
     auto words = ocrRect(mon, 1.5);
     auto allWords = words;
-    RECT bw{}, pw{};
-    bool hasB = gHwnd && GetWindowRect(gHwnd, &bw), hasP = gPanel && IsWindowVisible(gPanel) && GetWindowRect(gPanel, &pw);
+    // only text that is actually part of the game's browser window (not this chat, the panel, other apps)
     words.erase(std::remove_if(words.begin(), words.end(), [&](const Word &w) {
-        int cx = w.x + w.w / 2, cy = w.y + w.h / 2;
-        if (hasB && (cx < bw.left || cx > bw.right || cy < bw.top || cy > bw.bottom)) return true;
-        if (hasP && cx >= pw.left && cx <= pw.right && cy >= pw.top && cy <= pw.bottom) return true;
-        return false;
+        POINT pt{w.x + w.w / 2, w.y + w.h / 2};
+        HWND hw = WindowFromPoint(pt);
+        return !hw || GetAncestor(hw, GA_ROOT) != gHwnd;
     }), words.end());
     auto segs = segment(words);
     Layout nl = findLayout(segs, gMon.right, gMon.bottom);
     if (!nl.ok) {
-        segs = segment(allWords);
-        nl = findLayout(segs, gMon.right, gMon.bottom);
-    }
-    if (!nl.ok) {
         static double lastMsg = 0;
         int ns = 0, nb = 0;
-        for (auto &sg : segs) { std::string l = lower(sg.text); if (l == "store" || l.rfind("store ", 0) == 0) ns++; if (l.find("your bakery") != std::string::npos) nb++; }
+        for (auto &sg : segs) { std::string l = lower(sg.text); if (l == "store" || l.rfind("store ", 0) == 0) ns++; if (l.find("bakery") != std::string::npos) nb++; }
         if (now() - lastMsg > 15) {
-            logf("can't find the game layout: %d words on screen, %d 'Store' headings, %d 'Your bakery' headings", (int)allWords.size(), ns, nb);
+            logf("can't find the game layout: %d words on screen, %d store headings, %d bakery headings (in the game window)", (int)allWords.size(), ns, nb);
             lastMsg = now();
         }
         dbgf("--- layout FAILED (%d segs)", (int)segs.size());
