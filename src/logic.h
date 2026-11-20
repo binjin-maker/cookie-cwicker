@@ -200,12 +200,21 @@ struct Layout {
 static inline Layout findLayout(const std::vector<Seg> &segs, int scrW, int scrH) {
     Layout L;
     const Seg *store = nullptr, *bake = nullptr, *sell = nullptr, *foot = nullptr, *clickS = nullptr;
+    std::vector<const Seg *> stores, bakes;
     for (auto &s : segs) {
         std::string l = lower(s.text);
-        if (!store && (l == "store" || l.rfind("store ", 0) == 0)) store = &s;
-        if (!bake && l.find("your bakery") != std::string::npos) bake = &s;
+        if (l == "store" || l.rfind("store ", 0) == 0) stores.push_back(&s);
+        if (l.find("your bakery") != std::string::npos) bakes.push_back(&s);
         if (!foot && (l.find("reset my game") != std::string::npos || l.find("is inspired") != std::string::npos)) foot = &s;
     }
+    // the bakery heading sits left of the store heading, on roughly the same row
+    int bestGap = 1 << 30;
+    for (auto st : stores)
+        for (auto bk : bakes) {
+            if (bk->x >= st->x - 100 || std::abs(bk->cy() - st->cy()) > 150) continue;
+            int gap = st->x - bk->x;
+            if (gap < bestGap) { bestGap = gap; store = st; bake = bk; }
+        }
     if (!store || !bake) return L;
     for (auto &s : segs) {
         std::string l = lower(s.text);
@@ -227,7 +236,7 @@ static inline Layout findLayout(const std::vector<Seg> &segs, int scrW, int scrH
 }
 
 // ---------------- economy ----------------
-struct Econ { double bank = -1, cps = -1, perClick = -1; };
+struct Econ { double bank = -1, cps = -1, perClick = -1; bool guess = false; };
 
 static inline Econ readEcon(const std::vector<Seg> &segs, const Rect &left) {
     Econ e;
@@ -630,7 +639,7 @@ struct Brain {
             else if (t == "U") { double v; ss >> k >> v; unitCps[k] = v; }
             else if (t == "G") { double v; ss >> k >> v; growth[k] = v; }
             else if (t == "W") { double v; int n; ss >> k >> v >> n; word[k] = {v, n}; }
-            else if (t == "C") { double v; ss >> k >> v; corr[k] = v; }
+            else if (t == "C") { double v; ss >> k >> v; if (v >= 0.2 && v <= 5) corr[k] = v; }
             else if (t == "K") { int s, a; ss >> k >> s >> a; spot[k] = {s, a}; }
         }
         notchesPerPage = std::max(1, std::min(10, notchesPerPage));
@@ -709,7 +718,12 @@ static inline double effGain(const SimItem &it, const SimState &s, const Brain &
     (void)B; (void)text;
     switch (e.kind) {
     case E_BUILD: { auto f = s.unit.find(e.target); return f == s.unit.end() ? 0 : f->second; }
-    case E_BMULT: { auto f = s.total.find(e.target); return f == s.total.end() ? 0 : f->second * (e.v - 1) * c; }
+    case E_BMULT: {
+        auto f = s.total.find(e.target);
+        if (f == s.total.end()) return 0;
+        double tot = s.cps > 0 ? std::min(f->second, s.cps) : f->second;
+        return tot * (e.v - 1) * c;
+    }
     case E_CLICKPCT: return s.cps * e.v / 100 * s.rate * c;
     case E_CLICKMULT: return s.perClick * (e.v - 1) * s.rate * c;
     case E_GLOBAL: return s.cps * e.v * c;

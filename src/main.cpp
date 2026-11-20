@@ -31,13 +31,13 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 8;
+static const int VERSION = 9;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
 static std::atomic<bool> gPaused{false}, gQuit{false}, gOverlayOn{false};
 static std::atomic<double> gResumeAt{0};
-static HWND gHwnd = nullptr;
+static HWND gHwnd = nullptr, gPanel = nullptr;
 static RECT gMon{}, gWork{};
 static FILE *gLog = nullptr, *gDbg = nullptr;
 static LARGE_INTEGER gFreq;
@@ -1102,6 +1102,7 @@ static bool readEconNow(bool quiet = false) {
         for (auto &sg : segs) { std::string l = lower(sg.text); if (l.find("sec") != std::string::npos || l.find("o @") != std::string::npos) zeroish = true; }
         if (gEconTime > 0 && now() - gEconTime < 120 && gEcon.cps > 0) e.cps = gEcon.cps;
         else if (zeroish || gEcon.cps <= 0) e.cps = 0;
+        e.guess = true;
     }
     if (e.bank < 0 || e.cps < 0) {
         if (quiet) return false;
@@ -1138,12 +1139,23 @@ static void clickSpawned() {
     if (gTried.size() > 100) gTried.erase(gTried.begin(), gTried.begin() + 50);
 }
 
+static double gFailSince = 0;
 static bool detectLayout() {
     Rect mon{gMon.left, gMon.top, gMon.right, gMon.bottom};
-    auto segs = segment(ocrRect(mon, 1.5));
+    auto words = ocrRect(mon, 1.5);
+    RECT bw{}, pw{};
+    bool hasB = gHwnd && GetWindowRect(gHwnd, &bw), hasP = gPanel && IsWindowVisible(gPanel) && GetWindowRect(gPanel, &pw);
+    words.erase(std::remove_if(words.begin(), words.end(), [&](const Word &w) {
+        int cx = w.x + w.w / 2, cy = w.y + w.h / 2;
+        if (hasB && (cx < bw.left || cx > bw.right || cy < bw.top || cy > bw.bottom)) return true;
+        if (hasP && cx >= pw.left && cx <= pw.right && cy >= pw.top && cy <= pw.bottom) return true;
+        return false;
+    }), words.end());
+    auto segs = segment(words);
     Layout nl = findLayout(segs, gMon.right, gMon.bottom);
     if (!nl.ok) return false;
     L = nl;
+    gFailSince = 0;
     gDanger.clear();
     updateDanger(segs);
     if (!locateMainCookie()) logf("couldn't find the big cookie by color, using text-based guess");
@@ -1154,6 +1166,8 @@ static bool detectLayout() {
 
 static void connectionWatch() {
     if (!gameFocused() || gPaused) return;
+    if (gFailSince == 0) gFailSince = now();
+    if (now() - gFailSince < 20) return;
     if (now() - gLastRefresh < 10) return;
     Rect top{gMon.left, gMon.top, gMon.right, gMon.top + std::min(260L, (gMon.bottom - gMon.top) / 6)};
     bool ours = false;
@@ -1162,8 +1176,15 @@ static void connectionWatch() {
     bool errTitle = t.find("problem loading") != std::string::npos || t.find("not found") != std::string::npos ||
                     t.find("can't be reached") != std::string::npos || t.find("offline") != std::string::npos ||
                     t.find("error") != std::string::npos;
-    if (ours || errTitle) {
-        logf("game not readable (%s) - refreshing", ours ? "page looks broken" : "error page");
+    bool blank = false;
+    if (ours && !errTitle) {
+        Rect body{gMon.left, top.y1, gMon.right, gMon.bottom - 40};
+        int n = 0;
+        for (auto &w : ocrRect(body, 1.0)) if (w.text.size() >= 3) n++;
+        blank = n < 6;
+    }
+    if (blank || errTitle) {
+        logf("game not readable (%s) - refreshing", errTitle ? "error page" : "page is blank");
         setTask("Game isn't loading - refreshing every 10 s");
         pressF5();
         gLastRefresh = now();
@@ -1471,6 +1492,7 @@ static bool buy(const Item &target, double predictedGain, const std::string &eff
         }
     }
     double before = bankNow(), P0 = prodNow(gEcon);
+    bool econGuess0 = gEcon.guess;
     auto spots = clickSpots(cur);
     for (size_t attempt = 0; attempt < 2 && attempt < spots.size(); attempt++) {
         auto &sp = spots[attempt];
@@ -1521,8 +1543,9 @@ static bool buy(const Item &target, double predictedGain, const std::string &eff
             bool clean = now() - gLastBonus > 40;
             if (needLearn && clean && nap(1200) && readEconNow()) {
                 double dP = prodNow(gEcon) - P0;
-                if (!cur.research && !gBakery.count(cur.key) && gEcon.cps > 0) gBrain.learnUnit(cur.key, std::max(0.0, dP - 0.0));
-                if (cur.research && predictedGain > 0 && P0 > 0) {
+                bool trust = !gEcon.guess && !econGuess0 && dP > 0;
+                if (trust && !cur.research && !gBakery.count(cur.key) && gEcon.cps > 0) gBrain.learnUnit(cur.key, dP);
+                if (trust && cur.research && predictedGain > 0 && P0 > 0) {
                     if (effType == "unknown") gBrain.learnUnknown(cur.name + " " + cur.desc, dP / P0);
                     gBrain.learnCorr(effType, dP / predictedGain);
                     logf("learned: '%s' was worth +%s/s (expected +%s/s)", cur.name.c_str(), fmtNum(dP).c_str(), fmtNum(predictedGain).c_str());
@@ -1540,7 +1563,7 @@ static bool buy(const Item &target, double predictedGain, const std::string &eff
         logf("click on '%s' (%s) didn't buy it - trying another spot", cur.name.c_str(), sp.first.c_str());
     }
     gBrain.failedBuys++;
-    gBlack[cur.key] = now() + 180;
+    gBlack[cur.key] = now() + (gGoal.on && gGoal.key == cur.key ? 20 : 180);
     logf("couldn't buy '%s', skipping it for 3 min", cur.name.c_str());
     if (++gBuyFails >= 5) { gBuyPauseUntil = now() + 600; gBuyFails = 0; logf("too many failed buys - just clicking for 10 min"); }
     gBrain.save(BRAIN);
@@ -1701,7 +1724,6 @@ static void renderHud() {
 
 // ================= control panel window =================
 enum { ID_PAUSE = 101, ID_QUIT, ID_BUY, ID_GOLD, ID_FX, ID_HOURS, ID_CPS, ID_APPLY, ID_FORGET, ID_LOG, ID_STATUS, ID_STATS, ID_UPDATE };
-static HWND gPanel = nullptr;
 static std::atomic<bool> gForgetReq{false};
 static HBRUSH gBrBg, gBrEdit;
 static HFONT gUiFont, gUiBold;
@@ -1784,7 +1806,7 @@ static LRESULT CALLBACK panelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         } else if (id == ID_FORGET) {
             if (MessageBoxW(h, L"Wipe everything the bot has learned and start its brain from scratch?", L"CookieBot", MB_YESNO | MB_ICONQUESTION) == IDYES)
                 gForgetReq = true;
-        } else if (id == ID_UPDATE) { gUpdateCheckReq = true; logf("Checking GitHub for updates..."); }
+        } else if (id == ID_UPDATE) { static double last = 0; if (now() - last > 5) { last = now(); gUpdateCheckReq = true; logf("Checking GitHub for updates..."); } }
         InvalidateRect(GetDlgItem(h, id), nullptr, TRUE);
         return 0;
     }
