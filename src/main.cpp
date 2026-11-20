@@ -31,7 +31,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 10;
+static const int VERSION = 11;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -44,6 +44,8 @@ static LARGE_INTEGER gFreq;
 static double gStart = 0;
 static Brain gBrain;
 static std::atomic<bool> gUpdateCheckReq{false};
+static HANDLE gUpdEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+static void requestUpdateCheck() { gUpdateCheckReq = true; SetEvent(gUpdEvent); }
 
 // prompt bar: typed orders
 static std::mutex gPromptMu;
@@ -1822,7 +1824,7 @@ static LRESULT CALLBACK panelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         } else if (id == ID_FORGET) {
             if (MessageBoxW(h, L"Wipe everything the bot has learned and start its brain from scratch?", L"CookieBot", MB_YESNO | MB_ICONQUESTION) == IDYES)
                 gForgetReq = true;
-        } else if (id == ID_UPDATE) { static double last = 0; if (now() - last > 5) { last = now(); gUpdateCheckReq = true; logf("Checking GitHub for updates..."); } }
+        } else if (id == ID_UPDATE) { static double last = 0; if (now() - last > 5) { last = now(); requestUpdateCheck(); logf("Checking GitHub for updates..."); } }
         InvalidateRect(GetDlgItem(h, id), nullptr, TRUE);
         return 0;
     }
@@ -2001,7 +2003,7 @@ static void processCmds() {
         case O_CPS: cfgCps = std::max(1.0, std::min(12.0, o.val)); reply("clicking at %.1f/s", cfgCps); break;
         case O_HOURS: cfgHours = std::max(0.25, std::min(72.0, o.val)); reply("planning for %.1f h sessions", cfgHours); break;
         case O_RESCAN: gLastFull = -1000; gLastBakery = -1000; reply("rescanning the store and bakery"); break;
-        case O_UPDATE: gUpdateCheckReq = true; reply("checking GitHub for updates"); break;
+        case O_UPDATE: requestUpdateCheck(); reply("checking GitHub for updates"); break;
         case O_HELP: reply("try: buy 10 grandmas / skip bakery / cancel / bonus off / clicks 8 / rescan / pause"); break;
         default:
             if (gItems.empty()) { gPending.push_back({c, now() + 1200}); reply("got it - will do that once the store is read"); }
@@ -2017,14 +2019,17 @@ static std::atomic<bool> gUpdateReady{false};
 static std::wstring gSelf, gNew;
 
 static bool httpGet(const std::string &url, std::string &out, size_t maxBytes) {
-    HINTERNET net = InternetOpenA("CookieBot", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
-    if (!net) return false;
-    DWORD to = 15000;
-    InternetSetOptionA(net, INTERNET_OPTION_CONNECT_TIMEOUT, &to, sizeof to);
-    InternetSetOptionA(net, INTERNET_OPTION_RECEIVE_TIMEOUT, &to, sizeof to);
+    static HINTERNET net = nullptr;
+    if (!net) {
+        net = InternetOpenA("CookieBot", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+        if (!net) return false;
+        DWORD to = 8000;
+        InternetSetOptionA(net, INTERNET_OPTION_CONNECT_TIMEOUT, &to, sizeof to);
+        InternetSetOptionA(net, INTERNET_OPTION_RECEIVE_TIMEOUT, &to, sizeof to);
+    }
     std::string u = url + "?t=" + std::to_string((long long)time(nullptr));
     HINTERNET h = InternetOpenUrlA(net, u.c_str(), nullptr, 0,
-                                   INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE, 0);
+                                   INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE | INTERNET_FLAG_KEEP_CONNECTION, 0);
     bool ok = false;
     if (h) {
         DWORD code = 0, len = sizeof code;
@@ -2039,7 +2044,6 @@ static bool httpGet(const std::string &url, std::string &out, size_t maxBytes) {
         }
         InternetCloseHandle(h);
     }
-    InternetCloseHandle(net);
     return ok;
 }
 
@@ -2068,7 +2072,8 @@ static void updateThread() {
     for (;;) {
         bool manual = gUpdateCheckReq.exchange(false);
         if (checkUpdate(manual)) { gUpdateReady = true; gQuit = true; return; }
-        for (int i = 0; i < 3600 && !gQuit && !gUpdateCheckReq; i++) Sleep(1000);
+        double until = now() + 3600;
+        while (!gQuit && !gUpdateCheckReq && now() < until) WaitForSingleObject(gUpdEvent, 500);
         if (gQuit) return;
     }
 }

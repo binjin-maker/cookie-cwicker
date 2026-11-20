@@ -479,12 +479,12 @@ CONTENTS
   On Windows with MSYS2 (mingw-w64):
       pacman -S mingw-w64-x86_64-gcc
       windres cookiebot.rc -O coff -o cookiebot.res
-      g++ -O2 -std=c++17 -static -mwindows -o CookieBot.exe main.cpp cookiebot.res ^
+      g++ -O2 -s -std=c++17 -static -mwindows -o CookieBot.exe main.cpp cookiebot.res ^
           -lruntimeobject -lwinmm -lole32 -luser32 -lgdi32 -lwininet
 
   Cross-compiling from Linux:
       x86_64-w64-mingw32-windres cookiebot.rc -O coff -o cookiebot.res
-      x86_64-w64-mingw32-g++-posix -O2 -std=c++17 -static -mwindows \
+      x86_64-w64-mingw32-g++-posix -O2 -s -std=c++17 -static -mwindows \
           -o CookieBot.exe main.cpp cookiebot.res \
           -lruntimeobject -lwinmm -lole32 -luser32 -lgdi32 -lwininet
 
