@@ -31,7 +31,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 9;
+static const int VERSION = 10;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -1143,6 +1143,7 @@ static double gFailSince = 0;
 static bool detectLayout() {
     Rect mon{gMon.left, gMon.top, gMon.right, gMon.bottom};
     auto words = ocrRect(mon, 1.5);
+    auto allWords = words;
     RECT bw{}, pw{};
     bool hasB = gHwnd && GetWindowRect(gHwnd, &bw), hasP = gPanel && IsWindowVisible(gPanel) && GetWindowRect(gPanel, &pw);
     words.erase(std::remove_if(words.begin(), words.end(), [&](const Word &w) {
@@ -1153,7 +1154,22 @@ static bool detectLayout() {
     }), words.end());
     auto segs = segment(words);
     Layout nl = findLayout(segs, gMon.right, gMon.bottom);
-    if (!nl.ok) return false;
+    if (!nl.ok) {
+        segs = segment(allWords);
+        nl = findLayout(segs, gMon.right, gMon.bottom);
+    }
+    if (!nl.ok) {
+        static double lastMsg = 0;
+        int ns = 0, nb = 0;
+        for (auto &sg : segs) { std::string l = lower(sg.text); if (l == "store" || l.rfind("store ", 0) == 0) ns++; if (l.find("your bakery") != std::string::npos) nb++; }
+        if (now() - lastMsg > 15) {
+            logf("can't find the game layout: %d words on screen, %d 'Store' headings, %d 'Your bakery' headings", (int)allWords.size(), ns, nb);
+            lastMsg = now();
+        }
+        dbgf("--- layout FAILED (%d segs)", (int)segs.size());
+        for (auto &sg : segs) dbgf("  seg (%d,%d) '%s'", sg.x, sg.y, sg.text.c_str());
+        return false;
+    }
     L = nl;
     gFailSince = 0;
     gDanger.clear();
@@ -2163,8 +2179,8 @@ int main(int argc, char **argv) {
             gLastScreenCheck = 0;
             screenGuard();
             if (gQuit || gPaused) continue;
+            gOverlayOn = true;
             if (!detectLayout()) {
-                gOverlayOn = false;
                 gMiss++;
                 if (gMiss >= 2) connectionWatch();
                 Sleep(1500); continue;

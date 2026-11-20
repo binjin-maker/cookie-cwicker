@@ -211,7 +211,7 @@ static inline Layout findLayout(const std::vector<Seg> &segs, int scrW, int scrH
     int bestGap = 1 << 30;
     for (auto st : stores)
         for (auto bk : bakes) {
-            if (bk->x >= st->x - 100 || std::abs(bk->cy() - st->cy()) > 150) continue;
+            if (bk->x >= st->x - 100) continue;
             int gap = st->x - bk->x;
             if (gap < bestGap) { bestGap = gap; store = st; bake = bk; }
         }
