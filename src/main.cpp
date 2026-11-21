@@ -20,6 +20,7 @@
 #include <cstdarg>
 #include <ctime>
 #include "logic.h"
+#include <climits>
 
 using namespace ABI::Windows::Storage::Streams;
 
@@ -31,7 +32,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 12;
+static const int VERSION = 13;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -56,6 +57,10 @@ static std::deque<std::string> gCmds;
 struct Goal { bool on = false; std::string key, name; int target = 0, start = 0, count = 1, bought = 0; double since = 0; };
 static Goal gGoal;
 static void updateGoalHud();
+namespace cc {
+void onKey(DWORD vk, bool down); void onPhys(); bool asking(); HWND target(); void answer(const std::string &s); bool active();
+void start(int m); void stop(); void renderHud(); bool hudWanted(); void init();
+}
 static void processCmds();
 
 static double now() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return (double)c.QuadPart / gFreq.QuadPart; }
@@ -284,10 +289,10 @@ static void overlayThread() {
             } else { ShowWindow(gVig, SW_HIDE); ShowWindow(gFx, SW_HIDE); ShowWindow(gPath, SW_HIDE); pathShown = false; ShowWindow(gRead, SW_HIDE); readShown = false; ShowWindow(gScan, SW_HIDE); scanShown = false; scanW = 0; ShowWindow(gDead, SW_HIDE); deadShown = false; }
             shown = on; gVigVisible = on;
         }
-        bool hudOn = (cfgFx || gPromptOpen) && gHwnd && gameFocused() && !gQuit;
+        bool hudOn = ((cfgFx || gPromptOpen) && gHwnd && gameFocused() && !gQuit) || cc::hudWanted();
         if (hudOn != hudShown) { ShowWindow(gHudWnd, hudOn ? SW_SHOWNOACTIVATE : SW_HIDE); hudShown = hudOn; }
         if (hudOn && now() - lastHud > 0.1) { renderHud(); lastHud = now(); }
-        bool grab = gPaused;
+        bool grab = gPaused && !cc::active();
         if (grab != hudGrab) {
             LONG ex = GetWindowLongW(gHudWnd, GWL_EXSTYLE);
             SetWindowLongW(gHudWnd, GWL_EXSTYLE, grab ? (ex & ~WS_EX_TRANSPARENT) : (ex | WS_EX_TRANSPARENT));
@@ -610,11 +615,22 @@ static void pressF5() {
     SendInput(2, in, sizeof(INPUT));
 }
 
+static std::atomic<bool> gCcBusy{false};
+static void ccStartAsync(int m, double delay) {
+    if (gCcBusy.exchange(true)) return;
+    std::thread([m, delay] {
+        if (delay > 0) Sleep((DWORD)(delay * 1000));
+        cc::start(m);
+        gCcBusy = false;
+    }).detach();
+}
+
 // ---------- user input watcher ----------
 static LRESULT CALLBACK mouseHook(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION) {
         auto *m = (MSLLHOOKSTRUCT *)lp;
-        if (!(m->flags & LLMHF_INJECTED) && !gPaused && now() > gResumeAt) {
+        if (!(m->flags & LLMHF_INJECTED)) cc::onPhys();
+        if (!(m->flags & LLMHF_INJECTED) && !cc::active() && !gPaused && now() > gResumeAt) {
             gPaused = true;
             logf("You touched the mouse - paused. F8 or Resume to continue.");
         }
@@ -630,6 +646,24 @@ static LRESULT CALLBACK keyHook(int code, WPARAM wp, LPARAM lp) {
     if (k->flags & LLKHF_INJECTED) return CallNextHookEx(nullptr, code, wp, lp);
     DWORD vk = k->vkCode;
     bool down = wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN;
+    if (cc::asking()) {
+        if (GetForegroundWindow() != cc::target() || vk == VK_F6 || vk == VK_F7 || vk == VK_F8 || vk == VK_F9) return CallNextHookEx(nullptr, code, wp, lp);
+        if (!down) return 1;
+        std::lock_guard<std::mutex> lk(gPromptMu);
+        gPromptLast = now();
+        if (vk == VK_RETURN) { if (!gPromptText.empty()) cc::answer(gPromptText); gPromptText.clear(); gPromptOpen = false; }
+        else if (vk == VK_ESCAPE) { cc::answer("let me show you"); gPromptText.clear(); gPromptOpen = false; }
+        else if (vk == VK_BACK) { if (!gPromptText.empty()) gPromptText.pop_back(); }
+        else if (gPromptText.size() < 80) {
+            if (vk >= 'A' && vk <= 'Z') gPromptText += (char)(vk - 'A' + 'a');
+            else if (vk >= '0' && vk <= '9') gPromptText += (char)vk;
+            else if (vk == VK_SPACE) gPromptText += ' ';
+            else if (vk == VK_OEM_7) gPromptText += '\'';
+        }
+        return 1;
+    }
+    cc::onKey(vk, down);
+    if (vk != VK_F6 && vk != VK_F7 && vk != VK_F8 && vk != VK_F9) cc::onPhys();
     bool mods = (GetAsyncKeyState(VK_CONTROL) & 0x8000) || (GetAsyncKeyState(VK_MENU) & 0x8000) || (GetAsyncKeyState(VK_LWIN) & 0x8000);
     if (vk == VK_F8 || vk == VK_F9 || mods) return CallNextHookEx(nullptr, code, wp, lp);
     if (!gPromptOpen) {
@@ -665,18 +699,22 @@ static LRESULT CALLBACK keyHook(int code, WPARAM wp, LPARAM lp) {
 static void inputThread() {
     HHOOK h = SetWindowsHookExW(WH_MOUSE_LL, mouseHook, GetModuleHandleW(nullptr), 0);
     HHOOK hk = SetWindowsHookExW(WH_KEYBOARD_LL, keyHook, GetModuleHandleW(nullptr), 0);
-    bool f8 = false, f9 = false;
+    bool f8 = false, f9 = false, f6 = false, f7 = false;
     while (!gQuit) {
+        bool k6 = GetAsyncKeyState(VK_F6) & 0x8000, k7 = GetAsyncKeyState(VK_F7) & 0x8000;
+        if (k6 && !f6) ccStartAsync(1, 0);
+        if (k7 && !f7) ccStartAsync(2, 0);
+        f6 = k6; f7 = k7;
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
         bool k8 = GetAsyncKeyState(VK_F8) & 0x8000, k9 = GetAsyncKeyState(VK_F9) & 0x8000;
-        if (k8 && !f8) {
+        if (k8 && !f8 && !cc::active()) {
             if (gPaused) { gResumeAt = now() + 3; gPaused = false; logf("Resuming in 3 s - hands off the mouse."); }
             else { gPaused = true; logf("Paused (F8 to resume)"); }
         }
         if (k9 && !f9) { gQuit = true; logf("Quitting."); }
         f8 = k8; f9 = k9;
-        if (gPromptOpen && now() - gPromptLast > 30) promptClose();
+        if (gPromptOpen && !cc::asking() && now() - gPromptLast > 30) promptClose();
         Sleep(10);
     }
     if (h) UnhookWindowsHookEx(h);
@@ -1593,6 +1631,7 @@ static std::string fmtDur(double s) {
 }
 
 static void renderHud() {
+    if (cc::active()) { cc::renderHud(); return; }
     double k = 1.0;
     if (gHwnd) { UINT d = GetDpiForWindow(gHwnd); if (d) k = d / 96.0 * 0.9; }
     int W = (int)(470 * k), H = (int)(412 * k);
@@ -1734,8 +1773,10 @@ static void renderHud() {
     pushLayered(gHudWnd, hx, hy, W, H, bg.data(), gHudDrag);
 }
 
+#include "copycat.h"
+
 // ================= control panel window =================
-enum { ID_PAUSE = 101, ID_QUIT, ID_BUY, ID_GOLD, ID_FX, ID_HOURS, ID_CPS, ID_APPLY, ID_FORGET, ID_LOG, ID_STATUS, ID_STATS, ID_UPDATE };
+enum { ID_PAUSE = 101, ID_QUIT, ID_BUY, ID_GOLD, ID_FX, ID_HOURS, ID_CPS, ID_APPLY, ID_FORGET, ID_LOG, ID_STATUS, ID_STATS, ID_UPDATE, ID_WATCH, ID_COPY };
 static std::atomic<bool> gForgetReq{false};
 static HBRUSH gBrBg, gBrEdit;
 static HFONT gUiFont, gUiBold;
@@ -1791,6 +1832,8 @@ static LRESULT CALLBACK panelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         mk(L"LISTBOX", L"", LBS_NOINTEGRALHEIGHT | WS_VSCROLL | LBS_NOSEL, 16, 258, 420, 250, ID_LOG);
         mk(L"BUTTON", L"Forget what it learned", BS_OWNERDRAW, 16, 516, 205, 30, ID_FORGET);
         mk(L"BUTTON", L"Check for updates", BS_OWNERDRAW, 231, 516, 205, 30, ID_UPDATE);
+        mk(L"BUTTON", L"Watch me play (F6)", BS_OWNERDRAW, 16, 554, 205, 30, ID_WATCH);
+        mk(L"BUTTON", L"Let it play (F7)", BS_OWNERDRAW, 231, 554, 205, 30, ID_COPY);
         SetTimer(h, 1, 250, nullptr);
         return 0;
     }
@@ -1818,6 +1861,9 @@ static LRESULT CALLBACK panelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         } else if (id == ID_FORGET) {
             if (MessageBoxW(h, L"Wipe everything the bot has learned and start its brain from scratch?", L"CookieBot", MB_YESNO | MB_ICONQUESTION) == IDYES)
                 gForgetReq = true;
+        } else if (id == ID_WATCH || id == ID_COPY) {
+            if (cc::active()) std::thread(cc::stop).detach();
+            else { logf("Copycat: click your game window now - starting in 3 s"); ccStartAsync(id == ID_WATCH ? 1 : 2, 3); }
         } else if (id == ID_UPDATE) { static double last = 0; if (now() - last > 5) { last = now(); requestUpdateCheck(); logf("Checking GitHub for updates..."); } }
         InvalidateRect(GetDlgItem(h, id), nullptr, TRUE);
         return 0;
@@ -1867,7 +1913,7 @@ static void panelThread() {
     wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
     wc.hbrBackground = gBrBg; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
-    RECT r{0, 0, 452, 562};
+    RECT r{0, 0, 452, 600};
     AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
     wchar_t title[64]; swprintf(title, 64, L"CookieBot  v%d", VERSION);
     gPanel = CreateWindowExW(0, L"CookieBotPanel", title, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
@@ -2108,13 +2154,16 @@ int main(int argc, char **argv) {
     }
     std::thread(updateThread).detach();
     std::thread(panelThread).detach();
+    std::thread(overlayThread).detach();
+    std::thread(inputThread).detach();
     logf("CookieBot v%d - brain has %d purchases and %d upgrade types learned", VERSION, gBrain.purchases, (int)gBrain.corr.size());
     if (!ocrInit()) { MessageBoxW(nullptr, L"Windows OCR isn't available. Check cookiebot_log.txt.", L"CookieBot", MB_ICONERROR); return 1; }
+    cc::init();
     setState("WAITING"); setTask("Click on the game's browser tab to start");
     logf("Click on the browser tab with the game to start.");
     while (!gQuit) {
         HWND fg = GetForegroundWindow();
-        if (fg && titleOf(fg).find("cookies") != std::string::npos) { gHwnd = fg; break; }
+        if (fg && !cc::active() && titleOf(fg).find("cookies") != std::string::npos) { gHwnd = fg; break; }
         if (GetAsyncKeyState(VK_F9) & 0x8000) gQuit = true;
         Sleep(200);
     }
@@ -2129,8 +2178,7 @@ int main(int argc, char **argv) {
         MONITORINFO mi{sizeof mi}; GetMonitorInfo(m, &mi); gMon = mi.rcMonitor; gWork = mi.rcWork;
     }
     gResumeAt = now() + 3;
-    std::thread(overlayThread).detach();
-    std::thread(inputThread).detach();
+    gPaused = false;
     std::thread(econThread).detach();
     gStart = now();
     {
@@ -2148,6 +2196,7 @@ int main(int argc, char **argv) {
     double lastStatus = 0;
     std::string lastPlan;
     while (!gQuit) {
+        if (cc::active()) { gOverlayOn = false; Sleep(100); continue; }
         processCmds();
         checkGoal();
         if (gForgetReq) { gBrain = Brain(); DeleteFileA(BRAIN); gForgetReq = false; logf("Brain wiped - starting from base training"); }

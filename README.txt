@@ -21,6 +21,7 @@ CONTENTS
   15. Troubleshooting
   16. Auto-update
   17. Prompt bar (typed orders)
+  18. Copycat (watch you play any game, then play it)
 
 
 --------------------------------------------------------------------
@@ -565,3 +566,64 @@ CONTENTS
 
   Code: parseOrder() in logic.h (testable on Linux), processCmds()
   and checkGoal() in main.cpp, keyHook() for the typing.
+
+
+--------------------------------------------------------------------
+18. COPYCAT (WATCH YOU PLAY ANY GAME, THEN PLAY IT)
+--------------------------------------------------------------------
+  Works on any windowed / borderless game (true exclusive fullscreen
+  often captures black - use borderless windowed).
+
+  F6 (or "Watch me play")  click the game, press F6, play normally.
+      It records the game window 30 times a second (tiny 32x18 snapshot
+      + colour), every key you hold, mouse buttons and raw mouse
+      movement (works with locked FPS cursors). F6 again stops & saves.
+  F7 (or "Let it play")    it plays: each frame it finds the 12 most
+      similar-looking moments it remembers and does what was done
+      there (keys, buttons, mouse turn), weighted toward moments that
+      turned out well.
+      Touch the mouse/keyboard any time and it instantly hands over
+      and records you instead; 2 s after you let go it takes back over.
+      F7 again stops.
+
+  It keeps learning while it plays alone: its own frames are stored
+  too, and whatever happens after them (good or bad) changes how
+  much it trusts that move next time. ~4% of the time it tries a
+  small variation to discover things.
+
+  Good / bad: it reads numbers on the game screen ~5x a second and
+  finds the label next to each one. Health/armor/food/water/stamina
+  going up = good, down = bad; score/kills/coins/wood/stone/metal/
+  scrap/loot up = good; radiation/cold/poison up = bad; ammo, time,
+  fps and coordinates are ignored; numbers that tick constantly
+  (clocks) are ignored. A sudden red flash of the screen = bad.
+
+  Needs: if health/food/water/etc. gets low or keeps dropping, it
+  favours moments that raised that stat before ("trying to get").
+
+  Places: it groups what the screen looks like into up to 64
+  "places" (named by colour, e.g. "Place 4 (mid green)") and notes
+  which stats went up/down at each place - e.g. "wood goes up most
+  at Place 3".
+
+  Confused: if nothing it remembers looks like the screen for 1.5 s,
+  it lets go of everything, beeps and asks "What are you doing?" on
+  the HUD. Type an answer and Enter:
+     "running forward", "shooting", "turning around", "looting",
+     "jump over", "crouch and sneak left", "drink water", "wait 5"
+     -> it does that for a few seconds (number = seconds)
+     "let me show you" / Esc -> it watches you for 15 s
+  The answer is remembered with that screen; next time it sees
+  something similar it just does it without asking.
+
+  Analysis HUD (lower left while the game is in front): mode, speed
+  (fps, decide ms, number-reading ms), what numbers it's watching,
+  which place it's in, what it has worked out about each key/mouse
+  (moves you, turns the view, good/bad after), precision (slowing
+  aim before clicks), danger colours, what it's trying to get, what
+  it's pressing, how confused it is, and the last notes it wrote.
+
+  Files (in copycat\ next to the exe, one set per game exe name):
+     <game>.rec            everything it recorded + places + answers
+     <game>_journal.txt    readable notes, events and findings
+  Code: copycat.h.
