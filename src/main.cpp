@@ -34,7 +34,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 41;
+static const int VERSION = 42;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -641,6 +641,22 @@ static LRESULT CALLBACK mouseHook(int code, WPARAM wp, LPARAM lp) {
     return CallNextHookEx(nullptr, code, wp, lp);
 }
 
+// the character a key types with the current shift/caps/AltGr state (any symbol: < > = & : , - ...)
+static std::string keyText(DWORD vk, DWORD scan) {
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) return std::string(1, (char)('0' + vk - VK_NUMPAD0));
+    BYTE ks[256] = {};
+    for (int v : {VK_SHIFT, VK_LSHIFT, VK_RSHIFT, VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_MENU, VK_LMENU, VK_RMENU})
+        if (GetAsyncKeyState(v) & 0x8000) ks[v] = 0x80;
+    if (GetKeyState(VK_CAPITAL) & 1) ks[VK_CAPITAL] = 1;
+    wchar_t buf[8] = {};
+    HKL kl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), nullptr));
+    int n = ToUnicodeEx(vk, scan, ks, buf, 8, 4, kl);  // 4 = don't disturb dead-key state
+    if (n <= 0) return "";
+    std::string out;
+    for (int i = 0; i < n; i++) if (buf[i] >= 32 && buf[i] < 127) out += (char)(buf[i] >= 'A' && buf[i] <= 'Z' ? buf[i] - 'A' + 'a' : buf[i]);
+    return out;
+}
+
 static void promptClose() { std::lock_guard<std::mutex> lk(gPromptMu); gPromptText.clear(); gPromptOpen = false; }
 
 static LRESULT CALLBACK keyHook(int code, WPARAM wp, LPARAM lp) {
@@ -658,12 +674,7 @@ static LRESULT CALLBACK keyHook(int code, WPARAM wp, LPARAM lp) {
         if (vk == VK_RETURN) { if (!gPromptText.empty()) cc::answer(gPromptText); gPromptText.clear(); gPromptOpen = false; }
         else if (vk == VK_ESCAPE) { cc::answer("let me show you"); gPromptText.clear(); gPromptOpen = false; }
         else if (vk == VK_BACK) { if (!gPromptText.empty()) gPromptText.pop_back(); }
-        else if (gPromptText.size() < 80) {
-            if (vk >= 'A' && vk <= 'Z') gPromptText += (char)(vk - 'A' + 'a');
-            else if (vk >= '0' && vk <= '9') gPromptText += (char)vk;
-            else if (vk == VK_SPACE) gPromptText += ' ';
-            else if (vk == VK_OEM_7) gPromptText += '\'';
-        }
+        else if (gPromptText.size() < 400) gPromptText += keyText(vk, k->scanCode);
         return 1;
     }
     if (vk == VK_F10 && cc::active()) { if (down) cc::openTell(); return 1; }
@@ -684,20 +695,12 @@ static LRESULT CALLBACK keyHook(int code, WPARAM wp, LPARAM lp) {
     if (!down) return 1;
     std::lock_guard<std::mutex> lk(gPromptMu);
     gPromptLast = now();
-    bool shift = GetAsyncKeyState(VK_SHIFT) & 0x8000;
     if (vk == VK_ESCAPE) { gPromptText.clear(); gPromptOpen = false; }
     else if (vk == VK_RETURN) {
         if (!gPromptText.empty()) gCmds.push_back(gPromptText);
         gPromptText.clear(); gPromptOpen = false;
     } else if (vk == VK_BACK) { if (!gPromptText.empty()) gPromptText.pop_back(); if (gPromptText.empty()) gPromptOpen = false; }
-    else if (gPromptText.size() < 80) {
-        if (vk >= 'A' && vk <= 'Z') gPromptText += (char)(vk - 'A' + 'a');
-        else if (vk >= '0' && vk <= '9' && !shift) gPromptText += (char)vk;
-        else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) gPromptText += (char)('0' + vk - VK_NUMPAD0);
-        else if (vk == VK_SPACE) gPromptText += ' ';
-        else if (vk == VK_OEM_PERIOD || vk == VK_DECIMAL) gPromptText += '.';
-        else if (vk == VK_OEM_7) gPromptText += '\'';
-    }
+    else if (gPromptText.size() < 400) gPromptText += keyText(vk, k->scanCode);
     return 1;
 }
 
@@ -1752,6 +1755,7 @@ static void renderHud() {
     {
         std::string row;
         COLORREF col = dim;
+        if (ptext.size() > 60) ptext = "..." + ptext.substr(ptext.size() - 57);
         if (popen) { row = "> " + ptext + (std::fmod(now(), 1.0) < 0.55 ? "_" : " "); col = white; }
         else if (now() - replyAt < 6 && !reply.empty()) { row = reply; col = cyan; }
         else if (!order.empty()) { row = "ORDER  " + order; col = cyan; }

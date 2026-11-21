@@ -2501,6 +2501,7 @@ void renderHud() {
     for (auto it = ns.rbegin(); it != ns.rend() && y < 440; ++it) { text(fS, dim, 130, y, *it); y += 16; }
     std::string pr; bool po;
     { std::lock_guard<std::mutex> lk(gPromptMu); pr = gPromptText; po = gPromptOpen; }
+    if (pr.size() > 70) pr = "..." + pr.substr(pr.size() - 67);  // long rules: show the end you're typing
     if (m == 3) text(fB, hot, 18, 470, std::string(telling ? "Tell me something" : "What are you doing?") + "  > " + pr + (std::fmod(now(), 1.0) < 0.55 ? "_" : " "));
     else text(fS, dim, 18, 474, m == 1 ? "F6 stop watching  -  F7 let it play  -  F10 tell it something" : "touch mouse/keys to take over  -  F7 stop  -  F10 tell it something");
     (void)po;
