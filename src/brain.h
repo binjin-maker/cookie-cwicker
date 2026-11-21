@@ -46,11 +46,28 @@ static void fillCopycat(std::vector<Layer> &L) {
     L.push_back({"SEES", {"motion", "enemy", "objects", "movers", "target", "tool", "need", "you"}, std::vector<float>(cc::bIn, cc::bIn + 8)});
     L.push_back({"MEMORIES", {"memory 1", "memory 2", "memory 3", "memory 4", "memory 5", "memory 6"}, std::vector<float>(cc::bMem, cc::bMem + 6)});
     L.push_back({"WANTS", {"fight", "gather", "survive", "go for good", "be careful", "your order", "confused", "copy you"}, std::vector<float>(cc::bDrv, cc::bDrv + 8)});
-    L.push_back({"DOES", {"W", "A", "S", "D", "jump", "sprint", "crouch", "use (E)", "shoot", "aim", "turn left", "turn right"}, std::vector<float>(cc::bOut, cc::bOut + 12)});
+    // DOES: every key this game actually uses (most used first), mouse buttons and turning
+    Layer out{"DOES", {}, {}};
+    {
+        std::vector<std::pair<int, int>> used;
+        {
+            std::lock_guard<std::mutex> dl(cc::mu);
+            for (auto &kv : cc::keyStats) if (kv.first < 256 && kv.second.held > 5) used.push_back({kv.second.held, kv.first});
+        }
+        std::sort(used.rbegin(), used.rend());
+        if (used.empty()) for (int vk : {'W', 'A', 'S', 'D', (int)VK_SPACE, (int)VK_SHIFT, (int)VK_CONTROL, 'E'}) used.push_back({0, vk});
+        for (size_t i = 0; i < used.size() && i < 14; i++) { out.names.push_back(cc::keyName(used[i].second)); out.v.push_back(cc::outAll[used[i].second]); }
+        out.names.push_back("shoot"); out.v.push_back(cc::outAll[256]);
+        out.names.push_back("aim"); out.v.push_back(cc::outAll[257]);
+        out.names.push_back("turn left"); out.v.push_back(cc::bOut[10]);
+        out.names.push_back("turn right"); out.v.push_back(cc::bOut[11]);
+    }
+    L.push_back(out);
 }
 
 static void render(const std::vector<Layer> &L, const RECT &wa, double k, bool copy) {
-    int W = (int)(660 * k), H = (int)(360 * k);
+    size_t most = 0; for (auto &l : L) most = std::max(most, l.v.size());
+    int W = (int)(660 * k), H = (int)((most > 12 ? 360 + (most - 12) * 22 : 360) * k);
     std::vector<uint32_t> bg((size_t)W * H, 0);
     Canvas cv{W, H, bg.data()};
     float R = 16 * (float)k;

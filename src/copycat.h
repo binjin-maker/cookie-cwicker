@@ -1238,7 +1238,15 @@ static bool taskDue(Task &k, std::string &why) {
         return false;
     }
     if (k.kind == 3 && k.num >= 0 && t - classSeen[(int)k.num] < 0.5) { why = "saw a " + k.what; return true; }
-    if (k.kind == 4 && sigEnemy > 0.5f) { why = "enemy ahead"; return true; }
+    if (k.kind == 4) {
+        if (sigEnemy > 0.5f) { why = "enemy ahead"; return true; }
+        bool anyHostile = false; for (int c = 0; c < 80; c++) if (hostileClass(c)) anyHostile = true;
+        std::lock_guard<std::mutex> dl(det::mu);
+        if (now() - det::boxesAt < 0.5)
+            for (auto &b : det::boxes)
+                if (!b.own && (hostileClass(b.cls) || (!anyHostile && b.cls == 0))) { why = std::string("saw ") + className(b.cls); return true; }
+        return false;
+    }
     if (k.kind == 5 && lookingAt >= 0 && looks[lookingAt].label.find(k.what) != std::string::npos) { why = "looking at " + looks[lookingAt].label; return true; }
     return false;
 }
@@ -1314,6 +1322,10 @@ static bool taskCommand(const std::string &raw) {
         teaching = (int)tasks.size() - 1; teachStart = now();
         showUntil = now() + 3600;
         note("TEACHING \"%s\" - do it now, then F10 \"done\"%s", k.name.c_str(), k.kind ? "" : " (no 'when' - it'll only do it when asked)");
+        if (k.kind == 4) {
+            bool anyHostile = false; for (int c = 0; c < 80; c++) if (hostileClass(c)) anyHostile = true;
+            if (!anyHostile) note("(no enemy type set yet - any detected person will count. F10 \"person is enemy\" to be sure)");
+        }
         return true;
     }
     for (const char *ph : {" do ", " run ", " go "})
@@ -1345,6 +1357,11 @@ static int wantTool = -1;
 // live "brain" signals (0..1) for the neuron view
 std::mutex bmu;
 float bIn[8], bMem[6], bDrv[8], bOut[12];
+float outAll[259];  // every key (0-255) + LMB/RMB/MMB, how much it's being pressed right now
+static void feedOut(const uint8_t *keys, int btn) {
+    for (int vk = 0; vk < 256; vk++) outAll[vk] = outAll[vk] * 0.6f + (hasKey(keys, vk) ? 0.4f : 0.f);
+    for (int b = 0; b < 3; b++) outAll[256 + b] = outAll[256 + b] * 0.6f + ((btn >> b) & 1 ? 0.4f : 0.f);
+}
 
 static long decide(const uint8_t *f, const uint8_t *th) {
     double t0 = now();
@@ -1403,6 +1420,11 @@ static long decide(const uint8_t *f, const uint8_t *th) {
             const Frame &fr = data[h.i];
             double w = std::exp(-(h.d - dmin) / (dRef * 0.5 + 1)) * std::max(0.03, std::min(6.0, std::exp(0.9 * fr.value)));
             if (fr.self == 2) w *= 2;  // you corrected it here - trust that a lot
+            {
+                bool any = fr.btn || std::abs(fr.dx) + std::abs(fr.dy) > 2;
+                for (int b2 = 0; b2 < 32 && !any; b2++) if (fr.keys[b2]) any = true;
+                if (!any) w *= 0.25;  // standing still / typing / menus - copy those less
+            }
             if (needMask && (fr.up & needMask)) w *= 3;
             if (needMask && (fr.down & needMask)) w *= 0.4;
             if (enemyNear && (fr.btn & 1)) w *= 2.5;
@@ -1620,16 +1642,28 @@ static void loop() {
                     }
                 }
                 { std::lock_guard<std::mutex> lk(amu); actionTxt = act.empty() ? "nothing" : act + " (following a moment from memory)"; }
+                {
+                    static double idleSince = 0, lastIdleNote = 0;
+                    if (act.empty()) {
+                        if (idleSince == 0) idleSince = now();
+                        if (now() - idleSince > 6 && now() - lastIdleNote > 30) {
+                            size_t n; { std::lock_guard<std::mutex> lk(mu); n = data.size(); }
+                            if (clipIdx < 0) note("not doing anything: no memory to follow (%d frames recorded - record more with F6)", (int)n);
+                            else note("not doing anything: the memories that match this screen are moments where you stood still");
+                            lastIdleNote = now();
+                        }
+                    } else idleSince = 0;
+                }
                 if (confusion > 2.2) {
                     if (confusedSince == 0) confusedSince = now();
-                    if (now() - confusedSince > 1.5) {
+                    if (now() - confusedSince > 4 && data.size() > 3000) {
                         int bm = -1, bd = INT_MAX;
                         { std::lock_guard<std::mutex> lk(mu); for (size_t i = 0; i < mems.size(); i++) { int d = dist(f, mems[i].f); if (d < bd) { bd = d; bm = (int)i; } } }
                         if (bm >= 0 && bd < dRef * 1.6) {
                             plan = parseAnswer(mems[bm].text);
                             note("this looks like when you said \"%s\" - doing that", mems[bm].text.c_str());
                             confusedSince = 0;
-                        } else if (now() - lastAsk > 20) { openAsk(); continue; }
+                        } else if (now() - lastAsk > 60) { openAsk(); continue; }
                     }
                 } else confusedSince = 0;
             }
@@ -1641,6 +1675,7 @@ static void loop() {
             if (switchFrames > 0) { switchFrames--; ko[switchKey >> 3] |= 1 << (switchKey & 7); }
             {
                 std::lock_guard<std::mutex> bl(bmu);
+                feedOut(ko, b);
                 const int ok[8] = {'W', 'A', 'S', 'D', VK_SPACE, VK_SHIFT, VK_CONTROL, 'E'};
                 for (int i = 0; i < 8; i++) bOut[i] = bOut[i] * 0.6f + (hasKey(ko, ok[i]) ? 0.4f : 0.f);
                 bOut[8] = bOut[8] * 0.6f + ((b & 1) ? 0.4f : 0.f); bOut[9] = bOut[9] * 0.6f + ((b & 2) ? 0.4f : 0.f);
@@ -1713,6 +1748,7 @@ static void loop() {
                 bIn[6] = sigNeed; (void)numFlash;
                 bIn[7] = watching ? 1.f : 0.f;
                 if (watching) {
+                    feedOut(fr.keys, fr.btn);
                     const int ok[8] = {'W', 'A', 'S', 'D', VK_SPACE, VK_SHIFT, VK_CONTROL, 'E'};
                     for (int i = 0; i < 8; i++) bOut[i] = bOut[i] * 0.6f + (hasKey(fr.keys, ok[i]) ? 0.4f : 0.f);
                     bOut[8] = bOut[8] * 0.6f + ((fr.btn & 1) ? 0.4f : 0.f); bOut[9] = bOut[9] * 0.6f + ((fr.btn & 2) ? 0.4f : 0.f);
