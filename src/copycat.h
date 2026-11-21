@@ -305,8 +305,10 @@ static void ocrThread() {
         double sc = std::min(1.0, 1800.0 / std::max(1, r.x1 - r.x0));
         auto words = ocrRect(r, sc);
         ocrMs = (now() - t0) * 1000;
-        std::vector<int> seenNow;
+        struct Pend { float r; int idx; bool up; std::string why; };
+        std::vector<Pend> pend;
         std::string watch;
+        std::unique_lock<std::mutex> statLock(mu);
         for (size_t i = 0; i < words.size(); i++) {
             const Word &w = words[i];
             std::string digits; size_t k = 0;
@@ -342,7 +344,6 @@ static void ocrThread() {
             }
             Stat &s = stats[idx];
             s.seen++; s.samples++;
-            seenNow.push_back(idx);
             if (v != s.last) {
                 s.changes++;
                 bool clock = s.samples > 12 && s.changes > s.samples * 0.7;
@@ -352,12 +353,14 @@ static void ocrThread() {
                 if (!clock && s.weight != 0 && s.seen > 2) {
                     float r2 = (d > 0 ? 1.f : -1.f) * s.weight;
                     char why[128]; snprintf(why, sizeof why, "%s %s -> %s", s.label.c_str(), fmtNum(s.last).c_str(), fmtNum(v).c_str());
-                    reward(r2, idx, d > 0, why);
+                    pend.push_back({r2, idx, d > 0, why});
                 }
                 s.last = v; s.maxSeen = std::max(s.maxSeen, v);
             }
         }
         for (auto &s : stats) if (s.seen > 2 && s.weight != 0) watch += s.label + " " + fmtNum(s.last) + "  ";
+        statLock.unlock();
+        for (auto &p : pend) reward(p.r, p.idx, p.up, p.why.c_str());
         std::lock_guard<std::mutex> lk(amu);
         watchTxt = watch.empty() ? "no numbers on screen yet" : watch;
     }
@@ -537,11 +540,12 @@ static void decide(const uint8_t *f, uint8_t *keysOut, int &btn, int &mdx, int &
     struct Hit { int d; size_t i; };
     std::vector<Hit> top;
     std::vector<int> needIdx;
-    for (size_t s = 0; s < stats.size(); s++)
-        if (stats[s].need && stats[s].seen > 2 && stats[s].maxSeen > 0 && (stats[s].last < stats[s].maxSeen * 0.55 || stats[s].trend < -0.5)) needIdx.push_back((int)s);
-    uint32_t needMask = 0; for (int s : needIdx) if (s < 32) needMask |= 1u << s;
+    uint32_t needMask = 0;
     {
         std::lock_guard<std::mutex> lk(mu);
+        for (size_t s = 0; s < stats.size(); s++)
+            if (stats[s].need && stats[s].seen > 2 && stats[s].maxSeen > 0 && (stats[s].last < stats[s].maxSeen * 0.55 || stats[s].trend < -0.5)) needIdx.push_back((int)s);
+        for (int s : needIdx) if (s < 32) needMask |= 1u << s;
         if (data.size() < 60) { std::lock_guard<std::mutex> l2(amu); goal = "need more recording - press F6 and play for a bit"; return; }
         double tNow = now();
         for (size_t i = 0; i < data.size(); i++) {
@@ -747,7 +751,11 @@ void start(int m) {
     if (worker.joinable()) worker.join();
     tgt = fg;
     std::string n = exeOf(fg);
-    if (n != name || data.empty()) { name = n; fileLoad(); stats.clear(); keyStats.clear(); idle = KeyStat{}; }
+    if (n != name || data.empty()) {
+        name = n; fileLoad();
+        std::lock_guard<std::mutex> lk(mu);
+        stats.clear(); stats.reserve(MAXSTAT); keyStats.clear(); idle = KeyStat{};
+    }
     { std::lock_guard<std::mutex> lk(mu); demoN = 0; selfN = 0; for (auto &d : data) (d.self ? selfN : demoN)++; }
     computeRef();
     memset(heldOut, 0, sizeof heldOut); btnOut = 0;

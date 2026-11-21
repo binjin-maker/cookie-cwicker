@@ -32,7 +32,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 13;
+static const int VERSION = 14;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -2130,7 +2130,24 @@ static void applyUpdate() {
     }
 }
 
+static LONG WINAPI crashLog(EXCEPTION_POINTERS *e) {
+    if (FILE *f = fopen("cookiebot_crash.txt", "a")) {
+        time_t t = time(nullptr); char ts[32]; strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", localtime(&t));
+        uintptr_t addr = (uintptr_t)e->ExceptionRecord->ExceptionAddress, base = (uintptr_t)GetModuleHandleW(nullptr);
+        fprintf(f, "[%s] v%d crash code %08lX at exe+0x%llX (thread %lu, copycat %s)\n", ts, VERSION, e->ExceptionRecord->ExceptionCode,
+                (unsigned long long)(addr - base), GetCurrentThreadId(), cc::active() ? "on" : "off");
+        fclose(f);
+    }
+    if (gLog) { fprintf(gLog, "CRASHED - details in cookiebot_crash.txt\n"); fflush(gLog); }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int main(int argc, char **argv) {
+    SetUnhandledExceptionFilter(crashLog);
+    std::set_terminate([] {
+        if (FILE *f = fopen("cookiebot_crash.txt", "a")) { fprintf(f, "v%d std::terminate (thread misuse / uncaught exception)\n", VERSION); fclose(f); }
+        abort();
+    });
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--hours" && i + 1 < argc) cfgHours = atof(argv[++i]);
