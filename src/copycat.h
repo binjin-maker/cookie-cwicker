@@ -998,7 +998,7 @@ static void loadRules() {
                 for (const char *w : {" run", " away", " when", " if ", " low", " health", " then", " shoot", " kill"}) if ((" " + a + " ").find(w) != std::string::npos) bad = true;
                 if (!bad) classAlias[v] = a; else logf("Copycat: dropped a broken name for %s (\"%s\")", det::COCO[v], nm);
             }
-            else { float wv, wy; if (sscanf(line, "statweight %f %259[^\n]", &wv, nm) == 2) statOverride[nm] = wv; else if (sscanf(line, "camera2 %f %f", &wv, &wy) == 2) { ppcX = wv; ppcY = wy; }  // (old "camera" lines from v44 could be wrong: ignored) }
+            else { float wv, wy; if (sscanf(line, "statweight %f %259[^\n]", &wv, nm) == 2) statOverride[nm] = wv; else if (sscanf(line, "camera2 %f %f", &wv, &wy) == 2) { ppcX = wv; ppcY = wy; } }  // old "camera" lines (v44 could save a wrong one) are ignored
         }
     }
     fclose(f);
