@@ -53,7 +53,7 @@ Command-line options (optional): `--hours N` session length (default 8) · `--cp
 | Any letter (cookie mode) | Opens the cookie **order** prompt in the HUD |
 | Touch mouse | Cookie mode: pauses. Copycat playing: you take over (it records you), it resumes 2 s after you let go |
 
-**Control panel window:** status, Pause/Resume, Quit, toggles (Buy upgrades / Bonus cookies / Effects+HUD), session hours + clicks/s, stats, live log, *Forget what it learned*, *Check for updates*, *Watch me play (F6)*, *Let it play (F7)* (the panel buttons give you 3 s to click into your game).
+**Control panel window:** status, Pause/Resume, Quit, toggles (Buy upgrades / Bonus cookies / Effects+HUD), session hours + clicks/s, stats, live log, *Forget what it learned* (cookie brain only), **Wipe all** (deletes the cookie brain and every Copycat file for every game, then restarts with no knowledge; asks first), *Check for updates*, *Watch me play (F6)*, *Let it play (F7)* (the panel buttons give you 3 s to click into your game).
 
 ---
 

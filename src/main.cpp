@@ -34,7 +34,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 42;
+static const int VERSION = 43;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -1787,8 +1787,9 @@ static void renderHud() {
 #include "brain.h"
 
 // ================= control panel window =================
-enum { ID_PAUSE = 101, ID_QUIT, ID_BUY, ID_GOLD, ID_FX, ID_HOURS, ID_CPS, ID_APPLY, ID_FORGET, ID_LOG, ID_STATUS, ID_STATS, ID_UPDATE, ID_WATCH, ID_COPY };
+enum { ID_PAUSE = 101, ID_QUIT, ID_BUY, ID_GOLD, ID_FX, ID_HOURS, ID_CPS, ID_APPLY, ID_FORGET, ID_LOG, ID_STATUS, ID_STATS, ID_UPDATE, ID_WATCH, ID_COPY, ID_WIPE };
 static std::atomic<bool> gForgetReq{false};
+static std::atomic<bool> gWipeAll{false};  // wipe every file it learned, then restart
 static HBRUSH gBrBg, gBrEdit;
 static HFONT gUiFont, gUiBold;
 
@@ -1799,7 +1800,7 @@ static void drawButton(DRAWITEMSTRUCT *d) {
     bool pressed = d->itemState & ODS_SELECTED;
     RECT r = d->rcItem;
     FillRect(d->hDC, &r, gBrBg);
-    COLORREF fill = id == ID_QUIT ? RGB(150, 45, 55) : id == ID_FORGET ? RGB(60, 60, 80) : toggle ? (on ? RGB(35, 110, 210) : RGB(45, 52, 70)) : RGB(35, 110, 210);
+    COLORREF fill = id == ID_QUIT || id == ID_WIPE ? RGB(150, 45, 55) : id == ID_FORGET ? RGB(60, 60, 80) : toggle ? (on ? RGB(35, 110, 210) : RGB(45, 52, 70)) : RGB(35, 110, 210);
     if (id == ID_PAUSE && !gPaused) fill = RGB(200, 140, 30);
     if (pressed) fill = RGB(GetRValue(fill) * 3 / 4, GetGValue(fill) * 3 / 4, GetBValue(fill) * 3 / 4);
     HBRUSH b = CreateSolidBrush(fill);
@@ -1845,6 +1846,7 @@ static LRESULT CALLBACK panelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         mk(L"BUTTON", L"Check for updates", BS_OWNERDRAW, 231, 516, 205, 30, ID_UPDATE);
         mk(L"BUTTON", L"Watch me play (F6)", BS_OWNERDRAW, 16, 554, 205, 30, ID_WATCH);
         mk(L"BUTTON", L"Let it play (F7)", BS_OWNERDRAW, 231, 554, 205, 30, ID_COPY);
+        mk(L"BUTTON", L"Wipe all  -  restart with no knowledge", BS_OWNERDRAW, 16, 592, 420, 30, ID_WIPE);
         SetTimer(h, 1, 250, nullptr);
         return 0;
     }
@@ -1872,6 +1874,12 @@ static LRESULT CALLBACK panelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         } else if (id == ID_FORGET) {
             if (MessageBoxW(h, L"Wipe everything the bot has learned and start its brain from scratch?", L"CookieBot", MB_YESNO | MB_ICONQUESTION) == IDYES)
                 gForgetReq = true;
+        } else if (id == ID_WIPE) {
+            if (MessageBoxW(h, L"Delete EVERYTHING it learned - cookie brain plus every Copycat recording, rule, task, name, hotbar and camera setting for every game - and restart from zero?\n\nThis can't be undone.",
+                            L"CookieBot - wipe all", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) {
+                logf("Wiping everything and restarting...");
+                gWipeAll = true; gQuit = true;
+            }
         } else if (id == ID_WATCH || id == ID_COPY) {
             if (cc::active()) std::thread(cc::stop).detach();
             else { logf("Copycat: click your game window now - starting in 3 s"); ccStartAsync(id == ID_WATCH ? 1 : 2, 3); }
@@ -1924,7 +1932,7 @@ static void panelThread() {
     wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
     wc.hbrBackground = gBrBg; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
-    RECT r{0, 0, 452, 600};
+    RECT r{0, 0, 452, 638};
     AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
     wchar_t title[64]; swprintf(title, 64, L"CookieBot  v%d", VERSION);
     gPanel = CreateWindowExW(0, L"CookieBotPanel", title, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
@@ -2177,6 +2185,21 @@ static void applyUpdate() {
     }
 }
 
+static void wipeAndRestart() {
+    if (cc::active()) cc::stop();
+    DeleteFileA(BRAIN);
+    WIN32_FIND_DATAA fd; HANDLE fh = FindFirstFileA("copycat\\*", &fd);
+    if (fh != INVALID_HANDLE_VALUE) {
+        do if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) DeleteFileA(("copycat\\" + std::string(fd.cFileName)).c_str());
+        while (FindNextFileA(fh, &fd));
+        FindClose(fh);
+    }
+    logf("Wiped everything it learned - restarting with no knowledge");
+    STARTUPINFOW si{sizeof si}; PROCESS_INFORMATION pi{};
+    std::wstring cmd = GetCommandLineW();
+    if (CreateProcessW(gSelf.c_str(), &cmd[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+}
+
 static LONG WINAPI crashLog(EXCEPTION_POINTERS *e) {
     if (FILE *f = fopen("cookiebot_crash.txt", "a")) {
         time_t t = time(nullptr); char ts[32]; strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", localtime(&t));
@@ -2236,7 +2259,8 @@ int main(int argc, char **argv) {
         Sleep(200);
     }
     if (gQuit) {
-        if (gUpdateReady) applyUpdate();
+        if (gWipeAll) { if (gPanel) PostMessageW(gPanel, WM_CLOSE, 0, 0); Sleep(300); wipeAndRestart(); }
+        else if (gUpdateReady) applyUpdate();
         return 0;
     }
     logf("Found the game: \"%s\". Starting in 3 s - let go of the mouse.", titleOf(gHwnd).c_str());
@@ -2372,7 +2396,8 @@ int main(int argc, char **argv) {
     logf("stopped. bonus cookies clicked this run: %d", gGoldenClicks);
     if (gPanel) PostMessageW(gPanel, WM_CLOSE, 0, 0);
     Sleep(300);
-    if (gUpdateReady) applyUpdate();
+    if (gWipeAll) wipeAndRestart();
+    else if (gUpdateReady) applyUpdate();
     if (gLog) fclose(gLog);
     return 0;
 }
