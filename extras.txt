@@ -2,3 +2,4 @@ onnxruntime.dl_ onnxruntime.dll 21111832
 DirectML.dl_ DirectML.dll 18527776
 onnxruntime_providers_shared.dl_ onnxruntime_providers_shared.dll 21576
 yolox_s.onnx yolox_s.onnx 35858002
+yolox_tiny.onnx yolox_tiny.onnx 20219662

@@ -44,7 +44,8 @@ struct Plan { std::vector<WORD> keys; int btn = 0; float mdx = 0; double until =
 struct Memory { uint8_t f[FD]; std::string text; };
 
 std::atomic<const char *> stepLoop{"-"}, stepOcr{"-"}, stepHud{"-"};
-std::atomic<int> mode{0};  // 0 off, 1 watching, 2 copying, 3 asking
+std::atomic<int> mode{0};
+static double ppcX = 0, ppcY = 0;    // screen pixels the view moves per mouse count (learned)  // 0 off, 1 watching, 2 copying, 3 asking
 std::atomic<bool> takeover{false};
 HWND tgt = nullptr;
 std::string name = "game";
@@ -69,7 +70,7 @@ double dRef = 0;
 std::mutex amu;
 std::deque<std::string> notes;
 std::vector<std::string> findings;
-std::string goal = "-", confusedTxt = "-", actionTxt = "-", watchTxt = "-", placeTxt = "-", moverTxt = "-";
+std::string goal = "-", confusedTxt = "-", actionTxt = "-", watchTxt = "-", placeTxt = "-", moverTxt = "-", coordTxt = "-", camTxt = "-";
 double fps = 0, decideMs = 0, ocrMs = 0, confusion = 0, matchPct = 0;
 int demoN = 0, selfN = 0;
 Plan plan;
@@ -695,7 +696,7 @@ static void detThread() {
                 }
             }
         }
-        if (cfgFx) det::draw(r, bs, labels, kind); else det::hide();
+        { static double lastDraw = 0; if (!cfgFx) det::hide(); else if (now() - lastDraw > 0.066) { det::draw(r, bs, labels, kind); lastDraw = now(); } }
         { std::lock_guard<std::mutex> lk(det::mu); det::boxes = bs; det::boxesAt = t; }
         char hdr[96]; snprintf(hdr, sizeof hdr, "   [%s %.0f ms, %.0f/s]", det::onGpu ? "GPU" : "CPU", det::ms, det::rate);
         std::lock_guard<std::mutex> lk(amu);
@@ -920,6 +921,7 @@ static void saveRules() {
         for (int c = 0; c < 80; c++) if (classGood[c] || classBad[c]) fprintf(f, "class %d %d %d\n", c, classGood[c], classBad[c]);
         for (int c = 0; c < 80; c++) if (userClass[c]) fprintf(f, "userclass %d %d\n", c, userClass[c]);
         for (auto &kv : statOverride) fprintf(f, "statweight %g %s\n", kv.second, kv.first.c_str());
+        if (ppcX > 0) fprintf(f, "camera %g %g\n", ppcX, ppcY);
         for (int c = 0; c < 80; c++) if (!classAlias[c].empty()) fprintf(f, "alias %d %s\n", c, classAlias[c].c_str());
         fclose(f);
     }
@@ -982,7 +984,7 @@ static void loadRules() {
             else if (sscanf(line, "class %d %d %d", &v, &g2, &b2) == 3 && v >= 0 && v < 80) { classGood[v] = g2; classBad[v] = b2; }
             else if (sscanf(line, "userclass %d %d", &v, &g2) == 2 && v >= 0 && v < 80) userClass[v] = g2;
             else if (sscanf(line, "alias %d %259[^\n]", &v, nm) == 2 && v >= 0 && v < 80) classAlias[v] = nm;
-            else { float wv; if (sscanf(line, "statweight %f %259[^\n]", &wv, nm) == 2) statOverride[nm] = wv; }
+            else { float wv, wy; if (sscanf(line, "statweight %f %259[^\n]", &wv, nm) == 2) statOverride[nm] = wv; else if (sscanf(line, "camera %f %f", &wv, &wy) == 2) { ppcX = wv; ppcY = wy; } }
         }
     }
     fclose(f);
@@ -1162,6 +1164,54 @@ void openTell() {
     { std::lock_guard<std::mutex> lk(gPromptMu); gPromptText.clear(); gPromptOpen = true; gPromptLast = now(); }
 }
 
+
+// ---------- what the detector sees, in screen + mouse terms ----------
+struct Seen { int cls; float conf; int cx, cy, w, h; float offX, offY; bool own, hostile, friendly; };
+static std::vector<Seen> seenNow;   // every detection this moment
+static double calXY = 0, calXX = 0, calYY = 0, calYX = 0;
+static int calN = 0;
+static void updateSeen() {
+    Rect r; seenNow.clear();
+    if (!targetRect(r)) return;
+    int cx0 = (r.x0 + r.x1) / 2, cy0 = (r.y0 + r.y1) / 2;
+    std::lock_guard<std::mutex> dl(det::mu);
+    if (now() - det::boxesAt > 0.5) return;
+    bool anyHostile = false; for (int c = 0; c < 80; c++) if (hostileClass(c)) anyHostile = true;
+    for (auto &b : det::boxes) {
+        Seen s2; s2.cls = b.cls; s2.conf = b.conf; s2.cx = (b.x0 + b.x1) / 2; s2.cy = (b.y0 + b.y1) / 2; s2.w = b.x1 - b.x0; s2.h = b.y1 - b.y0;
+        s2.own = b.own; s2.hostile = !b.own && (hostileClass(b.cls) || (!anyHostile && b.cls == 0)); s2.friendly = !b.own && friendlyClass(b.cls);
+        s2.offX = ppcX > 0 ? (float)((s2.cx - cx0) / ppcX) : 0; s2.offY = ppcY > 0 ? (float)((s2.cy - cy0) / ppcY) : 0;
+        seenNow.push_back(s2);
+    }
+}
+// spare bytes at the end of each frame: [0]=enemy present, [1]=x, [2]=y (0-255 across the view), [3]=size
+const int EB = FC + CPW * CPW;
+static void stampEnemy(uint8_t *f) {
+    Rect r; if (!targetRect(r)) return;
+    const Seen *best = nullptr;
+    for (auto &s2 : seenNow) if (s2.hostile && (!best || s2.w * s2.h > best->w * best->h)) best = &s2;
+    if (!best || EB + 4 > FD) return;
+    f[EB] = 1;
+    f[EB + 1] = (uint8_t)std::max(0, std::min(255, (best->cx - r.x0) * 255 / std::max(1, r.x1 - r.x0)));
+    f[EB + 2] = (uint8_t)std::max(0, std::min(255, (best->cy - r.y0) * 255 / std::max(1, r.y1 - r.y0)));
+    f[EB + 3] = (uint8_t)std::max(1, std::min(255, best->w * 255 / std::max(1, r.x1 - r.x0)));
+}
+
+// ---------- camera skills ----------
+static double camX = 0, camY = 0;      // mouse counts still to turn
+static std::string camWhy = "-";
+static void camTurnPixels(double px, double py, const std::string &why) {
+    double kx = ppcX > 0 ? ppcX : 0.5, ky = ppcY > 0 ? ppcY : kx;
+    camX = px / kx; camY = py / ky; camWhy = why;
+}
+static void camStep(int &mx, int &my) {
+    if (std::fabs(camX) < 1 && std::fabs(camY) < 1) { camX = camY = 0; return; }
+    double sx = std::max(-60.0, std::min(60.0, camX * 0.25 + (camX > 0 ? 2 : -2)));
+    double sy = std::max(-40.0, std::min(40.0, camY * 0.25 + (camY > 0 ? 1 : -1)));
+    if (std::fabs(camX) < std::fabs(sx)) sx = camX;
+    if (std::fabs(camY) < std::fabs(sy)) sy = camY;
+    mx += (int)sx; my += (int)sy; camX -= (int)sx; camY -= (int)sy;
+}
 
 // ---------- taught tasks: you show it something, name it, say when to do it ----------
 struct Step { uint8_t keys[32]; uint8_t btn; int16_t dx, dy; };
@@ -1395,9 +1445,14 @@ static long decide(const uint8_t *f, const uint8_t *th) {
             if (rough.size() < 400) { rough.push_back({d, i}); std::push_heap(rough.begin(), rough.end(), cmp); }
             else if (d < rough.front().d) { std::pop_heap(rough.begin(), rough.end(), cmp); rough.back() = {d, i}; std::push_heap(rough.begin(), rough.end(), cmp); }
         }
-        // pass 2: full sharp comparison on those
+        // pass 2: full sharp comparison on those (+ where the enemy was on screen)
         for (auto &rh : rough) {
             int d = dist(f, data[rh.i].f);
+            const uint8_t *g = data[rh.i].f;
+            if (f[EB]) {
+                if (g[EB]) d += (int)((std::abs(f[EB + 1] - g[EB + 1]) + std::abs(f[EB + 2] - g[EB + 2])) * dRef / 160.0);
+                else d += (int)(dRef * 0.6);
+            }
             if ((int)top.size() < K) { top.push_back({d, rh.i}); std::push_heap(top.begin(), top.end(), cmp); }
             else if (d < top.front().d) { std::pop_heap(top.begin(), top.end(), cmp); top.back() = {d, rh.i}; std::push_heap(top.begin(), top.end(), cmp); }
         }
@@ -1502,6 +1557,7 @@ static void loop() {
         alignas(16) uint8_t f[FD]; uint8_t th[TN]; float red;
         stepLoop = "capture";
         if (!capture(f, th, red)) continue;
+        { std::lock_guard<std::mutex> lk(mu); updateSeen(); stampEnemy(f); }
         frames++;
         stepLoop = "colours";
         {
@@ -1675,6 +1731,35 @@ static void loop() {
                     }
                 } else confusedSince = 0;
             }
+            // camera skills: only fill in when the memory it's copying isn't already turning
+            if (!planOn && runningTask < 0 && std::abs(mx) < 3) {
+                static double lastScan = 0, lastTurnAround = 0, lastGlance = 0;
+                Rect cr; bool haveR = targetRect(cr);
+                if (std::fabs(camX) < 1 && haveR) {
+                    const Seen *want = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lk(mu);
+                        for (auto &s2 : seenNow)
+                            if (!s2.own && !s2.hostile && s2.cls != 0 && (s2.friendly || classGood[s2.cls] > classBad[s2.cls]) &&
+                                (!want || s2.w * s2.h > want->w * want->h)) want = &s2;
+                        if (want && now() - lastGlance > 1.5) {
+                            double px = want->cx - (cr.x0 + cr.x1) / 2.0, py = want->cy - (cr.y0 + cr.y1) / 2.0;
+                            if (std::fabs(px) > (cr.x1 - cr.x0) * 0.06) { camTurnPixels(px, py * 0.5, "turning to look at the " + className(want->cls)); lastGlance = now(); }
+                        }
+                    }
+                    if (std::fabs(camX) < 1 && now() - lastTurnAround > 6) {
+                        static double stillSince = 0;
+                        bool moving = hasKey(ko, 'W') || hasKey(ko, 'S');
+                        if (moving && change < 1.5) { if (stillSince == 0) stillSince = now(); } else stillSince = 0;
+                        if (stillSince && now() - stillSince > 2) { camTurnPixels((cr.x1 - cr.x0) * ((rand() & 1) ? 1.2 : -1.2), 0, "blocked - turning away"); lastTurnAround = now(); stillSince = 0; }
+                    }
+                    bool idleOut = !b; for (int q = 0; q < 32 && idleOut; q++) if (ko[q]) idleOut = false;
+                    if (std::fabs(camX) < 1 && (now() - lastRewardAt > 20 || idleOut) && now() - lastScan > 5) {
+                        camTurnPixels((cr.x1 - cr.x0) * ((rand() % 2) ? 0.6 : -0.6), 0, "looking around"); lastScan = now();
+                    }
+                }
+                camStep(mx, my);
+            } else camX = camY = 0;
             static double lastSwitch = 0; static int switchFrames = 0, switchKey = 0;
             if (!planOn && wantTool > 0 && curTool != wantTool && now() - lastSwitch > 4 && !hasKey(banned, '0' + wantTool)) {
                 switchKey = '0' + wantTool; switchFrames = 5; lastSwitch = now();
@@ -1727,6 +1812,20 @@ static void loop() {
                     }
                 if (!held && !fr.btn && std::abs(fr.dx) + std::abs(fr.dy) < 3) { idle.held++; idle.change += change; }
                 if (std::abs(fr.dx) > 2) { mouseCorrXY += fr.dx * sx; mouseXX += (double)fr.dx * fr.dx; mouseYY += (double)sx * sx; }
+                // learn how far the view slides per mouse count (sx is in 1/64ths of the view)
+                {
+                    Rect cr;
+                    if (targetRect(cr) && std::abs(sx) < 6 && std::abs(sy) < 4 && (std::abs(fr.dx) > 3 || std::abs(fr.dy) > 3)) {
+                        double pxX = -sx * (cr.x1 - cr.x0) / (double)FW, pxY = -sy * (cr.y1 - cr.y0) / (double)FH;
+                        calXY += fr.dx * pxX; calXX += (double)fr.dx * fr.dx; calYX += fr.dy * pxY; calYY += (double)fr.dy * fr.dy; calN++;
+                        if (calN > 30 && calXX > 0) {
+                            double kx = calXY / calXX, ky = calYY > 0 ? calYX / calYY : kx;
+                            if (kx > 0.005 && kx < 50) ppcX = kx;
+                            if (ky > 0.005 && ky < 50) ppcY = ky;
+                            if (calN == 31) note("learned the camera: 1 mouse count turns the view about %.2f pixels", ppcX);
+                        }
+                    }
+                }
                 double sp = std::hypot((double)fr.dx, (double)fr.dy);
                 recentDx.push_back(sp); if (recentDx.size() > 9) recentDx.erase(recentDx.begin());
                 aimAllSum += sp; aimAllN++;
@@ -1742,6 +1841,22 @@ static void loop() {
                 mv += (mv.empty() ? "" : ", ") + colourName(bin) + " " + shapeOf(q) + (mid ? " ahead" : q.x < MW / 2 ? " left" : " right") + (hostileBin(bin) ? " [ENEMY?]" : "");
             }
             moverTxt = mv.empty() ? "nothing moving" : mv;
+            {
+                std::string sc;
+                for (auto &s2 : seenNow) {
+                    if (sc.size() > 110) break;
+                    char b2[96];
+                    snprintf(b2, sizeof b2, "%s%s@%d,%d", sc.empty() ? "" : "  ", className(s2.cls).c_str(), s2.cx, s2.cy);
+                    sc += b2;
+                    if (ppcX > 0) { snprintf(b2, sizeof b2, "(%+.0f,%+.0f)", s2.offX, s2.offY); sc += b2; }
+                    if (s2.own) sc += "[yours]"; else if (s2.hostile) sc += "[ENEMY]";
+                }
+                char cb[160];
+                snprintf(cb, sizeof cb, "camera: %s   %s", ppcX > 0 ? (std::to_string(ppcX).substr(0, 4) + " px per mouse count").c_str() : "still learning (move the mouse while watched)",
+                         std::fabs(camX) >= 1 ? camWhy.c_str() : "");
+                coordTxt = sc.empty() ? "no detections" : sc;
+                camTxt = cb;
+            }
             if (watching) { actionTxt = "recording you"; if (m == 1) goal = "learning what you do"; }
             {
                 std::lock_guard<std::mutex> bl(bmu);
@@ -1863,8 +1978,8 @@ void renderHud() {
         DrawTextW(dc, w.c_str(), -1, &r, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     };
     COLORREF white = RGB(240, 244, 255), dim = RGB(150, 160, 185), lab = RGB(110, 150, 220), hot = RGB(ar, ag, ab);
-    std::string g, ct, at, wt, pt, mt, se; std::deque<std::string> ns; std::vector<std::string> fs;
-    { std::lock_guard<std::mutex> lk(amu); g = goal; ct = confusedTxt; at = actionTxt; wt = watchTxt; pt = placeTxt; mt = moverTxt; se = seesTxt; ns = notes; fs = findings; }
+    std::string g, ct, at, wt, pt, mt, se, co, cm; std::deque<std::string> ns; std::vector<std::string> fs;
+    { std::lock_guard<std::mutex> lk(amu); g = goal; ct = confusedTxt; at = actionTxt; wt = watchTxt; pt = placeTxt; mt = moverTxt; se = seesTxt; co = coordTxt; cm = camTxt; ns = notes; fs = findings; }
     std::string modeTxt = m == 1 ? "WATCHING YOU" : m == 3 ? "ASKING YOU" : takeover ? "YOU'RE DRIVING - RECORDING" : "PLAYING ON ITS OWN";
     text(fT, white, 18, 12, "COOKIEBOT COPYCAT");
     text(fB, hot, 220, 16, modeTxt);
@@ -1880,12 +1995,16 @@ void renderHud() {
     text(fS, white, 130, 107, pt);
     text(fL, lab, 18, 128, "SEES");
     text(fS, white, 130, 127, se);
-    text(fL, lab, 18, 148, "MOVING");
-    text(fS, white, 130, 147, mt);
-    text(fL, lab, 18, 168, "ANALYZING");
-    int y = 167;
+    text(fL, lab, 18, 148, "WHERE");
+    text(fS, white, 130, 147, co);
+    text(fL, lab, 18, 168, "CAMERA");
+    text(fS, white, 130, 167, cm);
+    text(fL, lab, 18, 188, "MOVING");
+    text(fS, white, 130, 187, mt);
+    text(fL, lab, 18, 208, "ANALYZING");
+    int y = 207;
     if (fs.empty()) { text(fS, dim, 130, y, "not enough data yet"); y += 16; }
-    for (auto &s : fs) { text(fS, white, 130, y, s); y += 16; if (y > 232) break; }
+    for (auto &s : fs) { text(fS, white, 130, y, s); y += 16; if (y > 236) break; }
     text(fL, lab, 18, 250, "TRYING TO GET");
     text(fS, white, 130, 249, g);
     text(fL, lab, 18, 270, "DOING");

@@ -639,7 +639,8 @@ CONTENTS
   Needs: if health/food/water/etc. gets low or keeps dropping, it
   favours moments that raised that stat before ("trying to get").
 
-  Object detector (real trained AI): YOLOX-S, a neural network
+  Object detector (real trained AI): YOLOX-Tiny (fast, 416 px) - or
+  YOLOX-S if Tiny isn't there - a neural network
   trained on 80 everyday things - people, cars, trucks, boats,
   planes, bikes, dogs, horses, cows, bears, birds, backpacks,
   bottles, knives, chairs... It runs on your GPU through ONNX Runtime
@@ -685,6 +686,18 @@ CONTENTS
   and corrected it count double. If nothing happens for 25 s it gets
   "bored" and tries its 2nd/3rd best idea; walking into a wall for 3 s
   counts as bad.
+
+  Coordinates: every detection's screen position (and, once the camera
+  is learned, how many mouse counts away from the crosshair it is) is
+  on the HUD WHERE row and is used by the AI. In fights it prefers
+  memories where the enemy was in the same part of the screen as now,
+  then copies how you aimed in that moment.
+
+  Camera skills (built in): it learns how far the view turns per mouse
+  count by watching you, then: looks around when idle or bored, turns
+  away when it's walking into something, and turns to look at
+  animals/items it considers good. It never turns onto people or
+  enemies by itself - aiming at those only comes from copying you.
 
   Moving things: each frame it removes the camera's own motion and
   finds what is still moving (players, NPCs, animals, vehicles),

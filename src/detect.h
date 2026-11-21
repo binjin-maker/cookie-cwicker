@@ -48,7 +48,9 @@ static std::wstring exeDir() {
 static bool load() {
     triedLoad = true;
     std::wstring dir = exeDir();
-    if (GetFileAttributesW((dir + L"yolox_s.onnx").c_str()) == INVALID_FILE_ATTRIBUTES || GetFileAttributesW((dir + L"onnxruntime.dll").c_str()) == INVALID_FILE_ATTRIBUTES) {
+    std::wstring modelFile = L"yolox_tiny.onnx"; S = 416;
+    if (GetFileAttributesW((dir + modelFile).c_str()) == INVALID_FILE_ATTRIBUTES) { modelFile = L"yolox_s.onnx"; S = 640; }
+    if (GetFileAttributesW((dir + modelFile).c_str()) == INVALID_FILE_ATTRIBUTES || GetFileAttributesW((dir + L"onnxruntime.dll").c_str()) == INVALID_FILE_ATTRIBUTES) {
         status = "detector files not downloaded yet";
         return false;
     }
@@ -69,7 +71,7 @@ static bool load() {
             auto addDml = (Status(__stdcall *)(void *, int))GetProcAddress(m, "OrtSessionOptionsAppendExecutionProvider_DML");
             if (!addDml || !ok(addDml(opts, 0), "gpu")) return false;
         } else fn<Status(__stdcall *)(void *, int)>(I_SetIntraThreads)(opts, 4);
-        std::wstring model = dir + L"yolox_s.onnx";
+        std::wstring model = dir + modelFile;
         return ok(fn<Status(__stdcall *)(void *, const wchar_t *, void *, void **)>(I_CreateSession)(env, model.c_str(), opts, &session), "model");
     };
     onGpu = makeSession(true);
@@ -78,6 +80,7 @@ static bool load() {
         if (!makeSession(false)) return false;
         status = "running on CPU (" + why + ")";
     } else status = "running on GPU";
+    status += S == 416 ? " (fast model)" : " (big model)";
     if (!ok(fn<Status(__stdcall *)(int, int, void **)>(I_CreateCpuMemInfo)(1, 0, &memInfo), "meminfo")) return false;
     ready = true;
     return true;
@@ -103,21 +106,22 @@ static bool run(const Rect &r, std::vector<Box> &out) {
     if (!mem) {
         mem = CreateCompatibleDC(scr);
         BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth = S; bi.bmiHeader.biHeight = -S; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biWidth = 640; bi.bmiHeader.biHeight = -640; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
         HBITMAP bmp = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, (void **)&bits, nullptr, 0);
         SelectObject(mem, bmp);
     }
-    SetStretchBltMode(mem, HALFTONE); SetBrushOrgEx(mem, 0, 0, nullptr);
+    SetStretchBltMode(mem, COLORONCOLOR);
     StretchBlt(mem, 0, 0, dw, dh, scr, r.x0, r.y0, w, h, SRCCOPY);
     GdiFlush();
     ReleaseDC(nullptr, scr);
-    static std::vector<float> input((size_t)3 * S * S);
+    static std::vector<float> input;
+    input.resize((size_t)3 * S * S);
     const size_t plane = (size_t)S * S;
     for (int y = 0; y < S; y++)
         for (int x = 0; x < S; x++) {
             size_t i = (size_t)y * S + x;
             float b = 114, g = 114, rr = 114;
-            if (x < dw && y < dh) { uint32_t p = bits[i]; b = (float)(p & 255); g = (float)((p >> 8) & 255); rr = (float)((p >> 16) & 255); }
+            if (x < dw && y < dh) { uint32_t p = bits[(size_t)y * 640 + x]; b = (float)(p & 255); g = (float)((p >> 8) & 255); rr = (float)((p >> 16) & 255); }
             input[i] = b; input[plane + i] = g; input[2 * plane + i] = rr;  // model wants BGR, 0-255
         }
     int64_t shape[4] = {1, 3, S, S};
