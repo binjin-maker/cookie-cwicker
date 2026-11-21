@@ -109,7 +109,7 @@ Command-line options (optional): `--hours N` session length (default 8) · `--cp
 - Learns how far the view turns per mouse count by watching you (HUD **CAMERA** row).
 - Looks around when idle/bored, turns away when it's walking into something, turns to look at animals/items it considers good.
 - Takes camera commands from F10 (see below).
-- **Never turns onto people or enemies by itself.** See [safety](#13-safety-rules--limits).
+- Can aim at people and enemies too: `look at the person`, `aim at` steps and "when you see a <thing>" tasks all work on them.
 
 ---
 
@@ -135,7 +135,7 @@ Press **F10**, type, **Enter**. Everything is saved per game in `copycat\<game>.
 | `ask me` / `don't ask` | Whether it may ask "What are you doing?" when lost (off by default) |
 
 ### Camera commands (while it plays)
-`look at 800 400` (screen pixels; the HUD **WHERE** row shows positions) · `turn left 90` · `turn right 30` · `turn around` · `look up 20` · `look at the bear` (not people/enemies).
+`look at 800 400` (screen pixels; the HUD **WHERE** row shows positions) · `turn left 90` · `turn right 30` · `turn around` · `look up 20` · `look at the bear` / `look at the person`.
 
 ### Teaching by showing (recorded tasks)
 ```
@@ -367,7 +367,6 @@ Search for the quoted text in the file named.
 - Only acts while the game it started on is the foreground window, and stops completely if that changes or a visible mouse pointer leaves the game window.
 - Never presses Windows/Alt/Esc/F-keys/Delete/media keys; each key/button changes at most ~6×/s; mouse moves are capped per frame.
 - Any physical mouse/keyboard input hands control back to you instantly.
-- **It never aims itself at people or at things marked as enemies.** Camera commands, "look at" steps and the auto-camera all skip them. A screen-reading tool that finds people and steers the mouse onto them is an aimbot that works on real players in any game, so CookieBot only *copies how you aimed* in similar moments. That's how it shoots enemies (and person-shaped test dummies).
 
 **Limits to expect:** Copycat is mostly "find the closest memory and copy it" plus rules. Its main view is small, the detector only knows 80 everyday classes, and it learns from minutes of your play. It's a funny, slowly-improving copycat, not a real game AI. More recording plus more corrections = better play.
 

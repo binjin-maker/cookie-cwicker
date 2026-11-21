@@ -1497,12 +1497,11 @@ static bool taskCommand(const std::string &raw) {
                 else if (tt.find(" down") != std::string::npos) { py = deg * perDeg; why = "looking down " + std::to_string((int)deg); }
                 else if (tt.find(" level") != std::string::npos || tt.find(" straight") != std::string::npos) { why = "can't tell where level is - say look up/down N"; }
                 if (px == 0 && py == 0) {
-                    // "look at the bear": things it detects, but not people or enemies
+                    // "look at the bear": anything it detects
                     std::lock_guard<std::mutex> lk(mu);
                     for (auto &s2 : seenNow) {
                         std::string n = className(s2.cls), n2 = det::COCO[s2.cls];
                         if (tt.find(" " + n) == std::string::npos && tt.find(" " + n2) == std::string::npos) continue;
-                        if (s2.cls == 0 || s2.hostile) { note("won't point the camera at people/enemies by itself - you aim at those"); return true; }
                         px = s2.cx - cx; py = s2.cy - cy; why = "looking at the " + n; break;
                     }
                 }
@@ -1894,7 +1893,7 @@ static void loop() {
                 std::lock_guard<std::mutex> lk(mu);
                 const Seen *best = nullptr;
                 for (auto &s2 : seenNow)
-                    if (!s2.own && (cls < 0 || s2.cls == cls) && s2.cls != 0 && !s2.hostile && (!best || s2.w * s2.h > best->w * best->h)) best = &s2;
+                    if (!s2.own && (cls < 0 || s2.cls == cls) && (!best || s2.w * s2.h > best->w * best->h)) best = &s2;
                 if (!best) return false;
                 px = best->cx - (r.x0 + r.x1) / 2.0; py = best->cy - (r.y0 + r.y1) / 2.0; hfrac = best->h / (double)(r.y1 - r.y0);
                 return true;
@@ -1912,7 +1911,6 @@ static void loop() {
                     switch (c.type) {
                     case C_LOOK: {
                         double px, py, hf;
-                        if (c.cls == 0) { done = true; what = "won't aim at people"; break; }
                         lastLookCls = c.cls;
                         if (findThing(c.cls, px, py, hf)) {
                             px += c.px; py += c.py;
@@ -1930,7 +1928,7 @@ static void loop() {
                     case C_UNTIL: {
                         ko['W' >> 3] |= 1 << ('W' & 7); if (c.sprint) ko[VK_SHIFT >> 3] |= 1 << (VK_SHIFT & 7);
                         double px, py, hf; int cls = c.cls >= 0 ? c.cls : lastLookCls;
-                        if (cls >= 0 && cls != 0 && findThing(cls, px, py, hf)) {
+                        if (cls >= 0 && findThing(cls, px, py, hf)) {
                             if (hf > 0.35) done = true;
                             Rect r; targetRect(r);
                             if (std::fabs(px) > (r.x1 - r.x0) * 0.05 && std::fabs(camX) < 1) camTurnPixels(px * 0.6, 0, "steering");
@@ -1966,7 +1964,7 @@ static void loop() {
             } else if (runningTask >= 0 && runningTask < (int)tasks.size()) {
                 Task &k = tasks[runningTask];
                 // a recorded skill tied to seeing a thing: face it first, then do what you showed
-                if (k.kind == 3 && k.num > 0 && runStep == 0 && !cmdInit) {
+                if (k.kind == 3 && k.num >= 0 && runStep == 0 && !cmdInit) {
                     double px, py, hf;
                     Rect r;
                     if (findThing((int)k.num, px, py, hf) && targetRect(r) && std::fabs(px) > (r.x1 - r.x0) * 0.04) {
@@ -1977,7 +1975,7 @@ static void loop() {
                         std::lock_guard<std::mutex> lk(amu); goal = "task \"" + k.name + "\" - lining up first";
                     } else cmdInit = true;
                 }
-                if (cmdInit || !(k.kind == 3 && k.num > 0)) {
+                if (cmdInit || !(k.kind == 3 && k.num >= 0)) {
                 if (runStep < k.steps.size()) {
                     const Step &st = k.steps[runStep++];
                     memcpy(ko, st.keys, 32); b = st.btn; mx = std::max(-80, std::min(80, (int)st.dx)); my = std::max(-80, std::min(80, (int)st.dy));
@@ -2056,7 +2054,7 @@ static void loop() {
                     {
                         std::lock_guard<std::mutex> lk(mu);
                         for (auto &s2 : seenNow)
-                            if (!s2.own && !s2.hostile && s2.cls != 0 && (s2.friendly || classGood[s2.cls] > classBad[s2.cls]) &&
+                            if (!s2.own && !s2.hostile && (s2.friendly || classGood[s2.cls] > classBad[s2.cls]) &&
                                 (!want || s2.w * s2.h > want->w * want->h)) want = &s2;
                         if (want && now() - lastGlance > 1.5) {
                             double px = want->cx - (cr.x0 + cr.x1) / 2.0, py = want->cy - (cr.y0 + cr.y1) / 2.0;
