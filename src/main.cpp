@@ -34,7 +34,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 45;
+static const int VERSION = 46;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -62,6 +62,7 @@ static void updateGoalHud();
 namespace cc {
 void onKey(DWORD vk, bool down); void onPhys(); bool asking(); HWND target(); void answer(const std::string &s); bool active();
 void start(int m); void stop(); void renderHud(); bool hudWanted(); void init(); void openTell();
+void runScript(const std::vector<std::string> &lines, bool replace); std::string gameName(); void requestTasks(); bool takeTasks(std::string &out);
 extern std::atomic<const char *> stepLoop, stepOcr, stepHud;
 }
 static void processCmds();
@@ -554,6 +555,8 @@ static bool pointSafe(int x, int y) {
     if (!L.ok || !inRect(x, y, L.game)) return false;
     if (!inRect(x, y, Rect{gMon.left, gMon.top, gMon.right - 1, gMon.bottom - 1})) return false;
     for (auto &d : gDanger) if (inRect(x, y, d)) return false;
+    RECT pr;  // never click through onto the editor window
+    if (gPanel && IsWindowVisible(gPanel) && !IsIconic(gPanel) && GetWindowRect(gPanel, &pr) && x >= pr.left && x < pr.right && y >= pr.top && y < pr.bottom) return false;
     return true;
 }
 
@@ -665,6 +668,10 @@ static LRESULT CALLBACK keyHook(int code, WPARAM wp, LPARAM lp) {
     if (k->flags & LLKHF_INJECTED) return CallNextHookEx(nullptr, code, wp, lp);
     DWORD vk = k->vkCode;
     bool down = wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN;
+    if (gPanel && GetForegroundWindow() == gPanel) {  // typing in the editor: not game input
+        if (!down) cc::onKey(vk, false);
+        return CallNextHookEx(nullptr, code, wp, lp);
+    }
     if (!down) cc::onKey(vk, false);  // always see key releases, or keys get stuck "held" in the recording
     if (cc::asking()) {
         if (GetForegroundWindow() != cc::target() || vk == VK_F6 || vk == VK_F7 || vk == VK_F8 || vk == VK_F9 || vk == VK_F10) return CallNextHookEx(nullptr, code, wp, lp);
@@ -1787,165 +1794,7 @@ static void renderHud() {
 #include "brain.h"
 
 // ================= control panel window =================
-enum { ID_PAUSE = 101, ID_QUIT, ID_BUY, ID_GOLD, ID_FX, ID_HOURS, ID_CPS, ID_APPLY, ID_FORGET, ID_LOG, ID_STATUS, ID_STATS, ID_UPDATE, ID_WATCH, ID_COPY, ID_WIPE };
-static std::atomic<bool> gForgetReq{false};
-static std::atomic<bool> gWipeAll{false};  // wipe every file it learned, then restart
-static HBRUSH gBrBg, gBrEdit;
-static HFONT gUiFont, gUiBold;
-
-static void drawButton(DRAWITEMSTRUCT *d) {
-    int id = d->CtlID;
-    bool toggle = id == ID_BUY || id == ID_GOLD || id == ID_FX;
-    bool on = id == ID_BUY ? cfgBuy : id == ID_GOLD ? cfgGolden : id == ID_FX ? cfgFx : false;
-    bool pressed = d->itemState & ODS_SELECTED;
-    RECT r = d->rcItem;
-    FillRect(d->hDC, &r, gBrBg);
-    COLORREF fill = id == ID_QUIT || id == ID_WIPE ? RGB(150, 45, 55) : id == ID_FORGET ? RGB(60, 60, 80) : toggle ? (on ? RGB(35, 110, 210) : RGB(45, 52, 70)) : RGB(35, 110, 210);
-    if (id == ID_PAUSE && !gPaused) fill = RGB(200, 140, 30);
-    if (pressed) fill = RGB(GetRValue(fill) * 3 / 4, GetGValue(fill) * 3 / 4, GetBValue(fill) * 3 / 4);
-    HBRUSH b = CreateSolidBrush(fill);
-    HPEN pn = CreatePen(PS_SOLID, 1, RGB(90, 150, 240));
-    HGDIOBJ ob = SelectObject(d->hDC, b), op = SelectObject(d->hDC, pn);
-    RoundRect(d->hDC, r.left, r.top, r.right, r.bottom, 12, 12);
-    SelectObject(d->hDC, ob); SelectObject(d->hDC, op); DeleteObject(b); DeleteObject(pn);
-    wchar_t t[64]; GetWindowTextW(d->hwndItem, t, 64);
-    std::wstring label = t;
-    if (toggle) label += on ? L":  ON" : L":  OFF";
-    if (id == ID_PAUSE) label = gPaused ? L"▶  Resume  (F8)" : L"⏸  Pause  (F8)";
-    SetBkMode(d->hDC, TRANSPARENT); SetTextColor(d->hDC, RGB(240, 245, 255));
-    SelectObject(d->hDC, gUiBold);
-    DrawTextW(d->hDC, label.c_str(), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-}
-
-static LRESULT CALLBACK panelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    static int seenLog = 0;
-    switch (m) {
-    case WM_CREATE: {
-        auto mk = [&](const wchar_t *cls, const wchar_t *txt, DWORD st, int x, int y, int cw, int ch, int id) {
-            HWND c = CreateWindowExW(0, cls, txt, WS_CHILD | WS_VISIBLE | st, x, y, cw, ch, h, (HMENU)(INT_PTR)id, nullptr, nullptr);
-            SendMessageW(c, WM_SETFONT, (WPARAM)gUiFont, TRUE);
-            return c;
-        };
-        mk(L"STATIC", L"", SS_LEFT, 16, 12, 420, 40, ID_STATUS);
-        mk(L"BUTTON", L"Pause", BS_OWNERDRAW, 16, 58, 205, 40, ID_PAUSE);
-        mk(L"BUTTON", L"✖  Quit  (F9)", BS_OWNERDRAW, 231, 58, 205, 40, ID_QUIT);
-        mk(L"BUTTON", L"Buy upgrades", BS_OWNERDRAW, 16, 108, 135, 34, ID_BUY);
-        mk(L"BUTTON", L"Bonus cookies", BS_OWNERDRAW, 159, 108, 135, 34, ID_GOLD);
-        mk(L"BUTTON", L"Effects + HUD", BS_OWNERDRAW, 302, 108, 134, 34, ID_FX);
-        mk(L"STATIC", L"Session hours", SS_LEFT, 16, 158, 90, 20, 0);
-        wchar_t b[32];
-        swprintf(b, 32, L"%.1f", cfgHours);
-        mk(L"EDIT", b, ES_LEFT | WS_BORDER, 110, 155, 60, 24, ID_HOURS);
-        mk(L"STATIC", L"Clicks/s (max 12)", SS_LEFT, 186, 158, 110, 20, 0);
-        swprintf(b, 32, L"%.1f", cfgCps);
-        mk(L"EDIT", b, ES_LEFT | WS_BORDER, 300, 155, 50, 24, ID_CPS);
-        mk(L"BUTTON", L"Apply", BS_OWNERDRAW, 360, 152, 76, 30, ID_APPLY);
-        mk(L"STATIC", L"", SS_LEFT, 16, 194, 420, 58, ID_STATS);
-        mk(L"LISTBOX", L"", LBS_NOINTEGRALHEIGHT | WS_VSCROLL | LBS_NOSEL, 16, 258, 420, 250, ID_LOG);
-        mk(L"BUTTON", L"Forget what it learned", BS_OWNERDRAW, 16, 516, 205, 30, ID_FORGET);
-        mk(L"BUTTON", L"Check for updates", BS_OWNERDRAW, 231, 516, 205, 30, ID_UPDATE);
-        mk(L"BUTTON", L"Watch me play (F6)", BS_OWNERDRAW, 16, 554, 205, 30, ID_WATCH);
-        mk(L"BUTTON", L"Let it play (F7)", BS_OWNERDRAW, 231, 554, 205, 30, ID_COPY);
-        mk(L"BUTTON", L"Wipe all  -  restart with no knowledge", BS_OWNERDRAW, 16, 592, 420, 30, ID_WIPE);
-        SetTimer(h, 1, 250, nullptr);
-        return 0;
-    }
-    case WM_DRAWITEM: drawButton((DRAWITEMSTRUCT *)l); return TRUE;
-    case WM_CTLCOLORSTATIC: case WM_CTLCOLORLISTBOX:
-        SetTextColor((HDC)w, RGB(215, 225, 245)); SetBkColor((HDC)w, RGB(14, 20, 34)); return (LRESULT)gBrBg;
-    case WM_CTLCOLOREDIT:
-        SetTextColor((HDC)w, RGB(240, 245, 255)); SetBkColor((HDC)w, RGB(28, 38, 60)); return (LRESULT)gBrEdit;
-    case WM_COMMAND: {
-        int id = LOWORD(w);
-        if (id == ID_PAUSE) {
-            if (gPaused) { gPaused = false; gResumeAt = now() + 2.5; if (gHwnd) SetForegroundWindow(gHwnd); logf("Resuming - switching to the game. Hands off the mouse."); }
-            else { gPaused = true; logf("Paused from the menu"); }
-        } else if (id == ID_QUIT) gQuit = true;
-        else if (id == ID_BUY) { cfgBuy = !cfgBuy; logf("Buying upgrades %s", cfgBuy ? "on" : "off"); }
-        else if (id == ID_GOLD) { cfgGolden = !cfgGolden; logf("Bonus cookie clicking %s", cfgGolden ? "on" : "off"); }
-        else if (id == ID_FX) { cfgFx = !cfgFx; logf("Effects + HUD %s", cfgFx ? "on" : "off"); }
-        else if (id == ID_APPLY) {
-            wchar_t b[32];
-            GetDlgItemTextW(h, ID_HOURS, b, 32); double hrs = _wtof(b);
-            GetDlgItemTextW(h, ID_CPS, b, 32); double c = _wtof(b);
-            if (hrs >= 0.25 && hrs <= 72) cfgHours = hrs;
-            if (c >= 1 && c <= 12) cfgCps = c;
-            logf("Settings: %.1f h sessions, %.1f clicks/s", cfgHours, cfgCps);
-        } else if (id == ID_FORGET) {
-            if (MessageBoxW(h, L"Wipe everything the bot has learned and start its brain from scratch?", L"CookieBot", MB_YESNO | MB_ICONQUESTION) == IDYES)
-                gForgetReq = true;
-        } else if (id == ID_WIPE) {
-            if (MessageBoxW(h, L"Delete EVERYTHING it learned - cookie brain plus every Copycat recording, rule, task, name, hotbar and camera setting for every game - and restart from zero?\n\nThis can't be undone.",
-                            L"CookieBot - wipe all", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) {
-                logf("Wiping everything and restarting...");
-                gWipeAll = true; gQuit = true;
-            }
-        } else if (id == ID_WATCH || id == ID_COPY) {
-            if (cc::active()) std::thread(cc::stop).detach();
-            else { logf("Copycat: click your game window now - starting in 3 s"); ccStartAsync(id == ID_WATCH ? 1 : 2, 3); }
-        } else if (id == ID_UPDATE) { static double last = 0; if (now() - last > 5) { last = now(); requestUpdateCheck(); logf("Checking GitHub for updates..."); } }
-        InvalidateRect(GetDlgItem(h, id), nullptr, TRUE);
-        return 0;
-    }
-    case WM_TIMER: {
-        std::string st, task; int serial; std::vector<std::string> newLines;
-        {
-            std::lock_guard<std::mutex> lk(gHud.mu);
-            st = gPaused ? "PAUSED" : gHud.state; task = gHud.task; serial = gHud.logSerial;
-            int fresh = std::min<int>(serial - seenLog, (int)gHud.log.size());
-            for (int i = (int)gHud.log.size() - fresh; i < (int)gHud.log.size(); i++) newLines.push_back(gHud.log[i]);
-            seenLog = serial;
-        }
-        std::string s1 = st + "  -  " + task;
-        SetDlgItemTextA(h, ID_STATUS, s1.c_str());
-        char b[400];
-        double up = gStart > 0 ? now() - gStart : 0;
-        snprintf(b, sizeof b, "Cookies %s   |   %s/s   |   %s/click\nBought %d this run, %d all-time   |   uptime %s\nBrain: %d upgrade types, %d buildings, %d price curves learned",
-                 fmtNum(gEconTime > 0 ? bankNow() : 0).c_str(), fmtNum(gEcon.cps).c_str(), fmtNum(gEcon.perClick).c_str(), gHud.buysRun, gBrain.purchases,
-                 fmtDur(up).c_str(), (int)gBrain.corr.size(), (int)gBrain.unitCps.size(), (int)gBrain.growth.size());
-        SetDlgItemTextA(h, ID_STATS, b);
-        HWND lb = GetDlgItem(h, ID_LOG);
-        for (auto &ln : newLines) {
-            std::wstring wl(ln.size() + 1, 0);
-            int n = MultiByteToWideChar(CP_UTF8, 0, ln.c_str(), (int)ln.size(), &wl[0], (int)wl.size()); wl.resize(n);
-            SendMessageW(lb, LB_ADDSTRING, 0, (LPARAM)wl.c_str());
-        }
-        int cnt = (int)SendMessageW(lb, LB_GETCOUNT, 0, 0);
-        while (cnt > 300) { SendMessageW(lb, LB_DELETESTRING, 0, 0); cnt--; }
-        if (!newLines.empty()) SendMessageW(lb, LB_SETTOPINDEX, cnt - 1, 0);
-        InvalidateRect(GetDlgItem(h, ID_PAUSE), nullptr, FALSE);
-        if (gQuit) DestroyWindow(h);
-        return 0;
-    }
-    case WM_CLOSE: gQuit = true; DestroyWindow(h); return 0;
-    case WM_DESTROY: PostQuitMessage(0); return 0;
-    }
-    return DefWindowProcW(h, m, w, l);
-}
-
-static void panelThread() {
-    gBrBg = CreateSolidBrush(RGB(14, 20, 34));
-    gBrEdit = CreateSolidBrush(RGB(28, 38, 60));
-    gUiFont = CreateFontW(-15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    gUiBold = CreateFontW(-15, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    WNDCLASSW wc{}; wc.lpfnWndProc = panelProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"CookieBotPanel";
-    wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
-    wc.hbrBackground = gBrBg; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    RegisterClassW(&wc);
-    RECT r{0, 0, 452, 638};
-    AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
-    wchar_t title[64]; swprintf(title, 64, L"CookieBot  v%d", VERSION);
-    gPanel = CreateWindowExW(0, L"CookieBotPanel", title, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                             CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-    BOOL dark = TRUE;
-    typedef HRESULT(WINAPI * DwmSet)(HWND, DWORD, LPCVOID, DWORD);
-    if (HMODULE dwm = LoadLibraryW(L"dwmapi.dll"))
-        if (auto f = (DwmSet)GetProcAddress(dwm, "DwmSetWindowAttribute")) f(gPanel, 20, &dark, sizeof dark);
-    ShowWindow(gPanel, SW_SHOWNORMAL);
-    MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-    gQuit = true;
-}
+#include "ui.h"
 
 // ================= main =================
 static void clickFor(double seconds) {

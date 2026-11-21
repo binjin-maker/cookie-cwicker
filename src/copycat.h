@@ -87,6 +87,7 @@ static void note(const char *fmt, ...) {
         time_t t = time(nullptr); char ts[16]; strftime(ts, sizeof ts, "%H:%M:%S", localtime(&t));
         fprintf(f, "[%s] %s\n", ts, b); fclose(f);
     }
+    logf("%s", b);  // shows in the panel's Output too
 }
 
 static std::string keyName(int vk) {
@@ -110,6 +111,15 @@ void onPhys() { if (mode == 2) physAt = now(); }
 bool asking() { return mode == 3; }
 HWND target() { return tgt; }
 void answer(const std::string &s) { std::lock_guard<std::mutex> lk(amu); answers.push_back(s); }
+// script editor: lines run on the Copycat thread (like F10), queued until Copycat is running
+static std::deque<std::string> scriptQ;
+static std::string dumpTxt; static std::atomic<bool> dumpReq{false}, dumpReady{false};
+void runScript(const std::vector<std::string> &lines, bool replace) {
+    std::lock_guard<std::mutex> lk(amu);
+    if (replace) scriptQ.push_back("\x01replace");
+    for (auto &l : lines) scriptQ.push_back(l);
+}
+std::string gameName() { return name; }
 bool active() { return mode != 0; }
 
 // ---------- raw mouse (works even when games lock the cursor) ----------
@@ -1963,6 +1973,44 @@ static long decide(const uint8_t *f, const uint8_t *th) {
     return pick;
 }
 
+// the current game's tasks as editor lines
+static std::string tasksText() {
+    std::string out = "// " + name + " tasks: edit them, then Execute to replace the explained ones\n// recorded tasks (shown as comments) stay as they are\n\n";
+    for (auto &k : tasks) {
+        std::string sc = k.script; while (!sc.empty() && sc.front() == ' ') sc.erase(0, 1);
+        if (!k.cmds.empty() && !sc.empty()) out += "set task " + k.name + (k.when.empty() ? "" : " " + k.when) + " then " + sc + "\n";
+        else out += "// " + k.name + " - recorded, " + (k.when.empty() ? "only when asked" : k.when) + "\n";
+    }
+    if (tasks.empty()) out += "// no tasks yet\n";
+    return out;
+}
+void requestTasks() {
+    if (!mode) { std::string t = tasksText(); std::lock_guard<std::mutex> lk(amu); dumpTxt = t; dumpReady = true; }
+    else dumpReq = true;
+}
+bool takeTasks(std::string &out) {
+    if (!dumpReady) return false;
+    std::lock_guard<std::mutex> lk(amu); out = dumpTxt; dumpReady = false; return true;
+}
+static void runQueuedScript() {
+    std::deque<std::string> q;
+    { std::lock_guard<std::mutex> lk(amu); q.swap(scriptQ); }
+    for (auto &ln : q) {
+        if (ln == "\x01replace") {
+            runningTask = -1;
+            size_t before = tasks.size();
+            tasks.erase(std::remove_if(tasks.begin(), tasks.end(), [](const Task &k) { return !k.cmds.empty(); }), tasks.end());
+            saveTasks();
+            note("cleared %d explained tasks - loading the new ones", (int)(before - tasks.size()));
+            continue;
+        }
+        logf("> %s", ln.c_str());
+        if (taskCommand(ln)) continue;
+        int pl = -1;
+        { std::lock_guard<std::mutex> lk(mu); if (!data.empty()) pl = data.back().place; }
+        if (!explain(ln, pl)) note("didn't understand: %s", ln.c_str());
+    }
+}
 static void loop() {
     uint8_t prev[FD] = {}; bool havePrev = false;
     float redAvg = 0;
@@ -1977,7 +2025,16 @@ static void loop() {
         if (now() - next > 0.2) next = now();
         if (now() - lastSec >= 1) { fps = frames / (now() - lastSec); frames = 0; lastSec = now(); }
         if (!IsWindow(tgt)) { note("the game window closed - stopping"); mode = 0; break; }
-        if (GetForegroundWindow() != tgt) {
+        if (mode != 3) runQueuedScript();
+        if (dumpReq.exchange(false)) { std::string t = tasksText(); std::lock_guard<std::mutex> lk(amu); dumpTxt = t; dumpReady = true; }
+        HWND fgw = GetForegroundWindow();
+        if (gPanel && fgw == gPanel) {  // you're in the editor: hold still, don't stop
+            static double lastNote = 0;
+            releaseAll();
+            if (mode == 2 && now() - lastNote > 20) { note("paused while you're in the editor - click the game to continue"); lastNote = now(); }
+            Sleep(30); continue;
+        }
+        if (fgw != tgt) {
             releaseAll();
             if (mode == 2 && !takeover) { note("the game isn't in front anymore - stopped playing for safety"); logf("Copycat stopped: game window lost focus"); mode = 0; break; }
             continue;
@@ -2083,6 +2140,11 @@ static void loop() {
             memset(ko, 0, 32);
             // never act if a visible cursor has wandered outside the game
             CURSORINFO ci{sizeof ci}; Rect cr;
+            RECT pr{};
+            if (gPanel && IsWindowVisible(gPanel) && !IsIconic(gPanel) && GetWindowRect(gPanel, &pr) && GetCursorInfo(&ci) &&
+                ci.ptScreenPos.x >= pr.left && ci.ptScreenPos.x < pr.right && ci.ptScreenPos.y >= pr.top && ci.ptScreenPos.y < pr.bottom) {
+                releaseAll(); continue;  // pointer is over the editor: wait, clicks would land on it
+            }
             if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) && targetRect(cr) && !inRect(ci.ptScreenPos.x, ci.ptScreenPos.y, cr)) {
                 releaseAll();
                 note("the mouse left the game window - stopped playing for safety");

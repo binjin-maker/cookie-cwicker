@@ -53,7 +53,17 @@ Command-line options (optional): `--hours N` session length (default 8) · `--cp
 | Any letter (cookie mode) | Opens the cookie **order** prompt in the HUD |
 | Touch mouse | Cookie mode: pauses. Copycat playing: you take over (it records you), it resumes 2 s after you let go |
 
-**Control panel window:** status, Pause/Resume, Quit, toggles (Buy upgrades / Bonus cookies / Effects+HUD), session hours + clicks/s, stats, live log, *Forget what it learned* (cookie brain only), **Wipe all** (deletes the cookie brain and every Copycat file for every game, then restarts with no knowledge; asks first), *Check for updates*, *Watch me play (F6)*, *Let it play (F7)* (the panel buttons give you 3 s to click into your game).
+**Main window (always on top, over the game):** a script editor like a code editor.
+
+* **Tabs** are files in `scripts\` next to the exe (`+` makes one, `x` deletes it). Line numbers on the left.
+* **Execute** (Ctrl+Enter) sends every line to Copycat as if you typed it into F10. `//` and `#` lines are comments. A line ending in `=>` (or a line starting with `=>`) is joined with the next one. If Copycat isn't running yet, the lines wait until it starts.
+* **Clear / Open / Save** (Ctrl+S). Tabs also save on their own when you switch or quit.
+* **Tasks** opens `<game>.tasks`: the current game's tasks as `set task ...` lines. Edit them and Execute to replace all the explained tasks. Recorded tasks show as comments and are kept.
+* **Gear** switches to Settings (all the old panel buttons). **Play (F7)** starts and stops Copycat.
+* **Output** shows the live log and Copycat's notes (bin = clear, copy = copy all).
+* It's hidden from the bot's own screenshots. Copycat holds still while you're in the window or the pointer is over it, and cookie mode never clicks through it. Drag it by the title bar.
+
+**Settings page (old control panel):** status, Pause/Resume, Quit, toggles (Buy upgrades / Bonus cookies / Effects+HUD), session hours + clicks/s, stats, live log, *Forget what it learned* (cookie brain only), **Wipe all** (deletes the cookie brain and every Copycat file for every game, then restarts with no knowledge; asks first), *Check for updates*, *Watch me play (F6)*, *Let it play (F7)* (the panel buttons give you 3 s to click into your game).
 
 ---
 
