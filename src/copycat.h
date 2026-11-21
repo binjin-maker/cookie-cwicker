@@ -45,7 +45,7 @@ struct Memory { uint8_t f[FD]; std::string text; };
 
 std::atomic<const char *> stepLoop{"-"}, stepOcr{"-"}, stepHud{"-"};
 std::atomic<int> mode{0};
-static double ppcX = 0, ppcY = 0;    // screen pixels the view moves per mouse count (learned)  // 0 off, 1 watching, 2 copying, 3 asking
+static double ppcX = 0, ppcY = 0, aimK = 0, aimKy = 0;  // aimK: px per count measured from its own aiming moves    // screen pixels the view moves per mouse count (learned)  // 0 off, 1 watching, 2 copying, 3 asking
 std::atomic<bool> takeover{false};
 HWND tgt = nullptr;
 std::string name = "game";
@@ -156,8 +156,17 @@ static void sendBtn(int bit, bool down) {
                                                                                          : (down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP);
     SendInput(1, &in, sizeof in);
 }
+// every relative move it sends, so a detector frame can be matched to where the camera was when it was shot
+struct MoveRec { double t, x, y, dx, dy; };
+static std::deque<MoveRec> moveHist; static double cumX = 0, cumY = 0; static std::mutex moveMu;
+static void cumAt(double t, double &x, double &y) {
+    std::lock_guard<std::mutex> lk(moveMu);
+    x = cumX; y = cumY;
+    for (auto it = moveHist.rbegin(); it != moveHist.rend(); ++it) { if (it->t <= t) return; x = it->x - it->dx; y = it->y - it->dy; }
+}
 static void sendMove(int dx, int dy) {
     if (!dx && !dy) return;
+    { std::lock_guard<std::mutex> lk(moveMu); cumX += dx; cumY += dy; moveHist.push_back({now(), cumX, cumY, (double)dx, (double)dy}); while (moveHist.size() > 400) moveHist.pop_front(); }
     INPUT in{}; in.type = INPUT_MOUSE; in.mi.dx = dx; in.mi.dy = dy; in.mi.dwFlags = MOUSEEVENTF_MOVE;
     SendInput(1, &in, sizeof in);
 }
@@ -922,7 +931,8 @@ static void saveRules() {
         for (int c = 0; c < 80; c++) if (classGood[c] || classBad[c]) fprintf(f, "class %d %d %d\n", c, classGood[c], classBad[c]);
         for (int c = 0; c < 80; c++) if (userClass[c]) fprintf(f, "userclass %d %d\n", c, userClass[c]);
         for (auto &kv : statOverride) fprintf(f, "statweight %g %s\n", kv.second, kv.first.c_str());
-        if (ppcX > 0) fprintf(f, "camera %g %g\n", ppcX, ppcY);
+        if (aimK > 0) fprintf(f, "camera %g %g\n", aimK, aimKy > 0 ? aimKy : aimK);  // measured while aiming beats measured while watching
+        else if (ppcX > 0) fprintf(f, "camera %g %g\n", ppcX, ppcY);
         for (int c = 0; c < 80; c++) if (!classAlias[c].empty()) fprintf(f, "alias %d %s\n", c, classAlias[c].c_str());
         fclose(f);
     }
@@ -1235,15 +1245,14 @@ static bool camForced = false;  // you told it where to look
 static bool camBg = false;  // a turn that keeps going while the next steps run
 static int forceAimCls = -1; static double forceAimUntil = 0;  // F10 "look at the <thing>"
 static double camDoneAt = 0;   // when the last queued turn finished
-static double aimK = 0;        // px per mouse count, measured from its own aiming moves
 static void camTurnPixels(double px, double py, const std::string &why) {
     double kx = aimK > 0 ? aimK : ppcX > 0 ? ppcX : 0.5, ky = aimK > 0 ? aimK : ppcY > 0 ? ppcY : kx;
     camX = px / kx; camY = py / ky; camWhy = why;
 }
 static void camStep(int &mx, int &my) {
     if (std::fabs(camX) < 1 && std::fabs(camY) < 1) { if (camX != 0 || camY != 0) camDoneAt = now(); camX = camY = 0; return; }
-    double sx = std::max(-60.0, std::min(60.0, camX * 0.25 + (camX > 0 ? 2 : -2)));
-    double sy = std::max(-40.0, std::min(40.0, camY * 0.25 + (camY > 0 ? 1 : -1)));
+    double sx = std::max(-160.0, std::min(160.0, camX * 0.35 + (camX > 0 ? 2 : -2)));
+    double sy = std::max(-100.0, std::min(100.0, camY * 0.35 + (camY > 0 ? 1 : -1)));
     if (std::fabs(camX) < std::fabs(sx)) sx = camX;
     if (std::fabs(camY) < std::fabs(sy)) sy = camY;
     mx += (int)sx; my += (int)sy; camX -= (int)sx; camY -= (int)sy;
@@ -1252,49 +1261,73 @@ static void camStep(int &mx, int &my) {
 
 // cls -2 = "enemy": anything it counts as hostile
 static std::string tgtName(int cls) { return cls == -2 ? std::string("enemy") : cls >= 0 && cls < 80 ? className(cls) : std::string("thing"); }
-// closed-loop aim: move, wait for a detector frame shot after the move stopped, measure again.
-// learns px-per-count from its own moves so it doesn't overshoot and swing back and forth.
-static struct AimState { int cls = -1; double lastShot = 0, errX = 0, errY = 0, movX = 0, movY = 0, tx = 0, ty = 0, lostSince = 0, lastSeen = 0, lastSearch = 0; bool moved = false, have = false; } aimS;
+// aiming in mouse-count space: each detector frame says where the target was when that screenshot was taken;
+// add the moves sent since then and it knows where the target is NOW, so it can correct every frame without waiting.
+// it also tracks the target's speed and leads it, and learns px-per-count from its own moves.
+static struct AimState { int cls = -1; double lastShot = 0, Ax = 0, Ay = 0, vX = 0, vY = 0, tA = 0, ex = 1e9, ey = 1e9, prevCamX = 0, prevEx = 0;
+                         double lostSince = 0, lastSeen = 0, lastSearch = 0, errX = 0; int hits = 0; bool have = false; } aimS;
 static void aimReset(int cls) { aimS = AimState(); aimS.cls = cls; }
-// 1 = on target, 0 = working on it, -1 = can't see it. offX/offY: pixels from the thing's centre.
-static int aimStep(int cls, double offX, double offY) {
+// 1 = on target, 0 = working on it, -1 = can't see it. adds this frame's mouse move to mx/my.
+static int aimStep(int cls, double offX, double offY, int &mx, int &my) {
     Rect r; if (!targetRect(r)) return -1;
     double W = r.x1 - r.x0, H = r.y1 - r.y0, cx = (r.x0 + r.x1) / 2.0, cy = (r.y0 + r.y1) / 2.0;
     if (aimS.cls != cls) aimReset(cls);
-    if (std::fabs(camX) >= 1 || std::fabs(camY) >= 1) return 0;
-    std::lock_guard<std::mutex> lk(mu);
-    bool fresh = seenRawShot > aimS.lastShot && seenRawShot > camDoneAt + 0.05;
-    if (!fresh) return (aimS.have && now() - aimS.lastSeen < 1.5) ? 0 : -1;
-    aimS.lastShot = seenRawShot;
-    double k = aimK > 0 ? aimK : ppcX > 0 ? ppcX : 1.0;
-    // where it should be now if it held still
-    double expX = aimS.tx - (aimS.moved ? aimS.movX * k : 0), expY = aimS.ty - (aimS.moved ? aimS.movY * k : 0);
-    const Seen *best = nullptr; double bd = 1e18;
-    for (auto &s2 : seenRaw) {
-        if (s2.own || (cls >= 0 && s2.cls != cls) || (cls == -2 && !s2.hostile)) continue;
-        double d = aimS.have ? std::hypot(s2.cx - expX, s2.cy - expY) : std::hypot(s2.cx - cx, s2.cy - cy);
-        if (d < bd) { bd = d; best = &s2; }
+    double kx = aimK > 0 ? aimK : ppcX > 0 ? ppcX : 1.0, ky = aimKy > 0 ? aimKy : ppcY > 0 ? ppcY : kx;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (seenRawShot > aimS.lastShot) {
+            aimS.lastShot = seenRawShot;
+            double camSx, camSy; cumAt(seenRawShot - 0.02, camSx, camSy);  // ~1 frame of render lag
+            // where the last target should be on this screenshot
+            double expX = cx + (aimS.Ax - camSx) * kx - offX, expY = cy + (aimS.Ay - camSy) * ky - offY;
+            const Seen *best = nullptr; double bd = 1e18;
+            for (auto &s2 : seenRaw) {
+                if (s2.own || (cls >= 0 && s2.cls != cls) || (cls == -2 && !s2.hostile)) continue;
+                double d = aimS.have ? std::hypot(s2.cx - expX, s2.cy - expY) : std::hypot(s2.cx - cx, s2.cy - cy);
+                if (d < bd) { bd = d; best = &s2; }
+            }
+            if (best && aimS.have && bd > W * 0.25 && now() - aimS.lastSeen < 0.4) best = nullptr;  // probably a different one - don't flick
+            if (best) {
+                double ex = best->cx + offX - cx, ey = best->cy + offY - cy;
+                // learn px per count: target roughly still, camera moved -> how far did it slide on screen
+                double dC = camSx - aimS.prevCamX;
+                if (aimS.have && std::fabs(dC) > 20 && std::fabs(aimS.vX) * (seenRawShot - aimS.tA) < 0.25 * std::fabs(dC)) {
+                    double kk = -(ex - aimS.prevEx) / dC;
+                    if (aimK > 0) kk = std::max(aimK * 0.5, std::min(aimK * 2, kk));
+                    if (kk > 0.02 && kk < 40) { aimK = aimK > 0 ? aimK * 0.75 + kk * 0.25 : kk; if (ppcX > 0 && ppcY > 0) aimKy = aimK * ppcY / ppcX; }
+                }
+                double Ax = camSx + ex / kx, Ay = camSy + ey / ky;
+                if (aimS.have) {
+                    double dt = seenRawShot - aimS.tA;
+                    if (dt > 0.02 && dt < 0.5) {
+                        double cap = W * 1.2 / kx;  // counts/s
+                        double nvx = std::max(-cap, std::min(cap, (Ax - aimS.Ax) / dt)), nvy = std::max(-cap, std::min(cap, (Ay - aimS.Ay) / dt)) * 0.5;
+                        bool ok = aimS.hits >= 2 && aimK > 0;  // speed is only trustworthy once px-per-count is measured
+                        aimS.vX = ok ? aimS.vX * 0.6 + nvx * 0.4 : 0; aimS.vY = ok ? aimS.vY * 0.6 + nvy * 0.4 : 0;
+                    }
+                }
+                aimS.Ax = Ax; aimS.Ay = Ay; aimS.tA = seenRawShot; aimS.ex = ex; aimS.ey = ey; aimS.errX = ex;
+                aimS.prevCamX = camSx; aimS.prevEx = ex; aimS.have = true; aimS.hits++; aimS.lastSeen = now(); aimS.lostSince = 0;
+            } else {
+                if (aimS.lostSince == 0) aimS.lostSince = now();
+                aimS.vX *= 0.5; aimS.vY *= 0.5;
+            }
+        }
     }
-    if (!best) {
-        if (aimS.lostSince == 0) aimS.lostSince = now();
-        aimS.moved = false;
-        return now() - aimS.lostSince > 1.2 ? -1 : 0;
-    }
-    aimS.lostSince = 0; aimS.lastSeen = now();
-    double ex = best->cx + offX - cx, ey = best->cy + offY - cy;
-    if (aimS.moved && aimS.have && std::fabs(aimS.movX) >= 4) {
-        double kk = (aimS.errX - ex) / aimS.movX;
-        if (aimK > 0) kk = std::max(aimK / 3, std::min(aimK * 3, kk));
-        if (kk > 0.03 && kk < 40) aimK = aimK > 0 ? aimK * 0.6 + kk * 0.4 : kk;
-    }
-    aimS.errX = ex; aimS.errY = ey; aimS.tx = best->cx; aimS.ty = best->cy; aimS.have = true; aimS.moved = false;
-    if (std::fabs(ex) < W * 0.03 && std::fabs(ey) < H * 0.04) return 1;
-    k = aimK > 0 ? aimK : ppcX > 0 ? ppcX : 1.0;
-    double gain = aimK > 0 ? 0.75 : 0.5;   // undershoot until it has measured itself
-    double mvx = ex / k * gain, mvy = ey / k * gain, cap = W * 0.5 / k;
-    mvx = std::max(-cap, std::min(cap, mvx)); mvy = std::max(-cap, std::min(cap, mvy));
-    camX = (int)mvx; camY = (int)mvy; camWhy = "aiming at the " + className(best->cls);
-    aimS.movX = (int)mvx; aimS.movY = (int)mvy; aimS.moved = true;
+    if (!aimS.have || now() - aimS.lastSeen > 1.0) return -1;
+    double nowX, nowY; cumAt(now(), nowX, nowY);
+    double lead = std::min(0.3, now() - aimS.tA) + 0.05;
+    double ecx = aimS.Ax + aimS.vX * lead - nowX, ecy = aimS.Ay + aimS.vY * lead - nowY;  // counts still to go
+    double epx = ecx * kx, epy = ecy * ky;
+    bool fresh = now() - aimS.lastSeen < 0.25;
+    if (fresh && std::fabs(epx) < W * 0.015 && std::fabs(epy) < H * 0.025 && std::fabs(aimS.ex) < W * 0.03 && std::fabs(aimS.ey) < H * 0.04) return 1;
+    double g = aimK > 0 ? 0.5 : 0.25;                       // part of the gap per frame (30/s); careful until measured
+    double capX = W * 0.15 / kx, capY = H * 0.15 / ky;      // per-frame limit
+    int sx = (int)std::lround(std::max(-capX, std::min(capX, ecx * g))), sy = (int)std::lround(std::max(-capY, std::min(capY, ecy * g)));
+    if (std::fabs(ecx) >= 1 && sx == 0) sx = ecx > 0 ? 1 : -1;
+    if (std::fabs(ecy) >= 1 && sy == 0) sy = ecy > 0 ? 1 : -1;
+    if (!fresh && now() - aimS.lastSeen > 0.4) return 0;  // lost for a moment: hold, don't drift
+    mx += sx; my += sy;
     return 0;
 }
 // lost it: one small sweep toward where it was last seen, then wait for the detector before sweeping again
@@ -1516,8 +1549,8 @@ static bool taskDue(Task &k, std::string &why) {
     double t = now();
     if (k.steps.empty() && k.cmds.empty()) return false;
     if (k.kind == 6) { if (t - k.lastRun > k.num) { why = "it's been " + std::to_string((int)k.num) + " s"; return true; } return false; }
-    // explained rules about things on screen (fights) can go again quickly; recorded ones wait 10 s
-    double gap = !k.cmds.empty() && (k.kind == 3 || k.kind == 4 || k.kind == 5) ? 1.5 : 10;
+    // explained rules about things on screen (fights) go again as soon as they finish while it's still true; recorded ones wait 10 s
+    double gap = !k.cmds.empty() && (k.kind == 3 || k.kind == 4 || k.kind == 5) ? 0.1 : 10;
     if (t - k.lastRun < gap) return false;
     return condNow(k, why);
 }
@@ -1549,7 +1582,7 @@ static bool condNow(Task &k, std::string &why) {
         bool wantEnemy = k.what.find("enem") != std::string::npos || k.what.find("hostile") != std::string::npos || k.what.find("bad guy") != std::string::npos;
         bool wantPerson = k.what.find("people") != std::string::npos || k.what.find("player") != std::string::npos || k.what.find("human") != std::string::npos;
         std::lock_guard<std::mutex> lk(mu);
-        for (auto &s2 : seenNow) {
+        for (auto &s2 : seenRaw) {
             if (s2.own || std::abs(cx - s2.cx) > s2.w / 2 + 4 || std::abs(cy - s2.cy) > s2.h / 2 + 4) continue;
             std::string n = className(s2.cls), n2 = det::COCO[s2.cls];
             if ((wantEnemy && s2.hostile) || (wantPerson && s2.cls == 0) || k.what.find(n) != std::string::npos || k.what.find(n2) != std::string::npos) {
@@ -2032,7 +2065,9 @@ static void loop() {
                 for (size_t i = 0; i < tasks.size(); i++) { std::string why; if (taskDue(tasks[i], why)) { runningTask = (int)i; runStep = 0; taskWhy = why; note("doing task \"%s\" (%s)", tasks[i].name.c_str(), why.c_str()); break; } }
             static size_t cmdIdx = 0; static double cmdStart = 0; static int cmdCount = 0; static bool cmdInit = false; static int lastLookCls = -1;
             static int lastRunning = -2;
-            if (runningTask != lastRunning) { cmdIdx = 0; cmdInit = false; lastRunning = runningTask; lastLookCls = -1; cmdStart = 0; }
+            static int trackCls = -1; static double trackOX = 0, trackOY = 0;  // keep the aim on it while the next steps fire
+            bool taskOn = runningTask >= 0;  // a task owns the controls this frame - nothing else decides
+            if (runningTask != lastRunning) { cmdIdx = 0; cmdInit = false; lastRunning = runningTask; lastLookCls = -1; cmdStart = 0; trackCls = -1; }
             auto findThing = [&](int cls, double &px, double &py, double &hfrac) -> bool {
                 Rect r; if (!targetRect(r)) return false;
                 std::lock_guard<std::mutex> lk(mu);
@@ -2057,7 +2092,8 @@ static void loop() {
                     case C_LOOK: {
                         if (lastLookCls != c.cls || cmdCount == 0) { aimReset(c.cls); cmdCount = 1; }
                         lastLookCls = c.cls;
-                        int a = aimStep(c.cls, c.px, c.py);
+                        int a = aimStep(c.cls, c.px, c.py, mx, my);
+                        if (a >= 0) { trackCls = c.cls; trackOX = c.px; trackOY = c.py; }
                         if (a == 1) done = true;
                         else if (a < 0) aimSearch(c.cls);
                         camStep(mx, my);
@@ -2073,7 +2109,7 @@ static void loop() {
                         if (cls >= 0 && findThing(cls, px, py, hf)) {
                             if (hf > 0.35) done = true;
                             Rect r; targetRect(r);
-                            if (std::fabs(px) > (r.x1 - r.x0) * 0.05) { aimStep(cls, 0, 0); camY = 0; }
+                            if (std::fabs(px) > (r.x1 - r.x0) * 0.05) { int dy = 0; aimStep(cls, 0, 0, mx, dy); }
                         }
                         camStep(mx, my);
                         if (el > c.secs) done = true;
@@ -2120,6 +2156,8 @@ static void loop() {
                     }
                     default: done = true;
                     }
+                    if (c.type == C_MOVE || c.type == C_TURN || c.type == C_AWAY || c.type == C_UNTIL || c.type == C_RUN) trackCls = -1;
+                    else if (c.type != C_LOOK && trackCls != -1) aimStep(trackCls, trackOX, trackOY, mx, my);
                     if (camBg && c.type != C_LOOK && c.type != C_TURN && c.type != C_UNTIL) { int bx = 0, by = 0; camStep(bx, by); mx += bx; my += by; }
                     if (std::fabs(camX) < 1 && std::fabs(camY) < 1) camBg = false;
                     if (done) { cmdIdx++; cmdInit = false; }
@@ -2132,9 +2170,10 @@ static void loop() {
                 // a recorded skill tied to seeing a thing: face it first, then do what you showed
                 if (k.kind == 3 && k.num >= 0 && runStep == 0 && !cmdInit) {
                     if (cmdStart == 0) { cmdStart = now(); aimReset((int)k.num); }
-                    int a = aimStep((int)k.num, 0, 0);
+                    memset(ko, 0, 32); b = 0; mx = my = 0;
+                    int a = aimStep((int)k.num, 0, 0, mx, my);
                     if (a == 0) {
-                        memset(ko, 0, 32); b = 0; mx = my = 0; camStep(mx, my); planOn = true;
+                        camStep(mx, my); planOn = true;
                         if (now() - cmdStart > 3) cmdInit = true;
                         std::lock_guard<std::mutex> lk(amu); goal = "task \"" + k.name + "\" - lining up first";
                     } else cmdInit = true;
@@ -2149,7 +2188,8 @@ static void loop() {
                 } else { k.lastRun = now(); k.runs++; runningTask = -1; cmdStart = 0; }
                 }
             }
-            if (planOn && runningTask >= 0) {
+            if (taskOn) {
+                if (runningTask < 0) { memset(ko, 0, 32); b = 0; mx = my = 0; }  // just finished: next frame can start it again
             } else if (planOn) {
                 memset(ko, 0, 32);
                 for (WORD vk : plan.keys) ko[vk >> 3] |= 1 << (vk & 7);
@@ -2207,9 +2247,10 @@ static void loop() {
                 } else confusedSince = 0;
             }
             // camera skills: only fill in when the memory it's copying isn't already turning
-            if (camForced && forceAimCls >= 0) {
+            if (taskOn) {
+            } else if (camForced && forceAimCls >= 0) {
                 mx = 0; my = 0;
-                int a = aimStep(forceAimCls, 0, 0);
+                int a = aimStep(forceAimCls, 0, 0, mx, my);
                 if (a < 0) aimSearch(forceAimCls);
                 camStep(mx, my);
                 if (a == 1 || now() > forceAimUntil) { forceAimCls = -1; camForced = false; camX = camY = 0; }
@@ -2245,7 +2286,7 @@ static void loop() {
                 camStep(mx, my);
             } else if (runningTask < 0) camX = camY = 0;
             static double lastSwitch = 0; static int switchFrames = 0, switchKey = 0;
-            if (!planOn && wantTool > 0 && curTool != wantTool && now() - lastSwitch > 4 && !hasKey(banned, '0' + wantTool)) {
+            if (!planOn && !taskOn && wantTool > 0 && curTool != wantTool && now() - lastSwitch > 4 && !hasKey(banned, '0' + wantTool)) {
                 switchKey = '0' + wantTool; switchFrames = 5; lastSwitch = now();
                 note("switching to %s", toolName(wantTool).c_str());
             }
