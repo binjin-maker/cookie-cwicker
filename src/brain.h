@@ -55,7 +55,7 @@ static void fillCopycat(std::vector<Layer> &L) {
             for (auto &kv : cc::keyStats) if (kv.first < 256 && kv.second.held > 5) used.push_back({kv.second.held, kv.first});
         }
         std::sort(used.rbegin(), used.rend());
-        if (used.empty()) for (int vk : {'W', 'A', 'S', 'D', (int)VK_SPACE, (int)VK_SHIFT, (int)VK_CONTROL, 'E'}) used.push_back({0, vk});
+        if (used.empty()) for (int vk : {(int)'W', (int)'A', (int)'S', (int)'D', (int)VK_SPACE, (int)VK_SHIFT, (int)VK_CONTROL, (int)'E'}) used.push_back({0, vk});
         for (size_t i = 0; i < used.size() && i < 14; i++) { out.names.push_back(cc::keyName(used[i].second)); out.v.push_back(cc::outAll[used[i].second]); }
         out.names.push_back("shoot"); out.v.push_back(cc::outAll[256]);
         out.names.push_back("aim"); out.v.push_back(cc::outAll[257]);
