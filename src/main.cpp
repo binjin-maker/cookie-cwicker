@@ -32,7 +32,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 15;
+static const int VERSION = 16;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -944,7 +944,7 @@ static std::vector<Word> ocrRect(const Rect &r, double want = 2.0, bool alsoInve
     if (sw <= 0 || sh <= 0) return out;
     double maxd = gOcrMax - 8;
     double s = std::min(want, maxd / std::max(sw, sh));
-    if (s < 1.0) {
+    if (s < std::min(1.0, want)) {
         int tile = (int)(maxd / want), ov = 80;
         for (int y = r.y0; y < r.y1; y += tile - ov) {
             for (int x = r.x0; x < r.x1; x += tile - ov) {
