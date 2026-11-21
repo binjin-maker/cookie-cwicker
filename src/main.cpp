@@ -32,7 +32,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 16;
+static const int VERSION = 17;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -2059,7 +2059,7 @@ static void processCmds() {
 static std::atomic<bool> gUpdateReady{false};
 static std::wstring gSelf, gNew;
 
-static bool httpGet(const std::string &url, std::string &out, size_t maxBytes) {
+static bool httpGet(const std::string &url, std::string &out, size_t maxBytes, const char *headers = nullptr) {
     static HINTERNET net = nullptr;
     if (!net) {
         net = InternetOpenA("CookieBot", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
@@ -2068,8 +2068,8 @@ static bool httpGet(const std::string &url, std::string &out, size_t maxBytes) {
         InternetSetOptionA(net, INTERNET_OPTION_CONNECT_TIMEOUT, &to, sizeof to);
         InternetSetOptionA(net, INTERNET_OPTION_RECEIVE_TIMEOUT, &to, sizeof to);
     }
-    std::string u = url + "?t=" + std::to_string((long long)time(nullptr));
-    HINTERNET h = InternetOpenUrlA(net, u.c_str(), nullptr, 0,
+    std::string u = url + (url.find('?') == std::string::npos ? "?t=" : "&t=") + std::to_string((long long)time(nullptr));
+    HINTERNET h = InternetOpenUrlA(net, u.c_str(), headers, headers ? (DWORD)-1 : 0,
                                    INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE | INTERNET_FLAG_KEEP_CONNECTION, 0);
     bool ok = false;
     if (h) {
@@ -2089,13 +2089,19 @@ static bool httpGet(const std::string &url, std::string &out, size_t maxBytes) {
 }
 
 static bool checkUpdate(bool manual) {
+    // ask GitHub for the newest commit, then read files pinned to it (the normal raw links can be ~5 min stale)
+    std::string sha, base = REPO_RAW;
+    if (httpGet("https://api.github.com/repos/binjin-maker/cookie-cwicker/commits/main", sha, 128, "Accept: application/vnd.github.sha\r\n")) {
+        while (!sha.empty() && isspace((unsigned char)sha.back())) sha.pop_back();
+        if (sha.size() == 40) base = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/" + sha + "/";
+    }
     std::string v;
-    if (!httpGet(std::string(REPO_RAW) + "version.txt", v, 64)) { if (manual) logf("couldn't reach GitHub to check for updates"); return false; }
+    if (!httpGet(base + "version.txt", v, 64)) { if (manual) logf("couldn't reach GitHub to check for updates"); return false; }
     int remote = atoi(v.c_str());
     if (remote <= VERSION) { if (manual) logf("already up to date (v%d)", VERSION); return false; }
     logf("update found: v%d -> v%d, downloading", VERSION, remote);
     std::string exe;
-    if (!httpGet(std::string(REPO_RAW) + "CookieBot.ex_", exe, 64u << 20) || exe.size() < 100000 || exe.compare(0, 2, "MZ") != 0) {
+    if (!httpGet(base + "CookieBot.ex_", exe, 64u << 20) || exe.size() < 100000 || exe.compare(0, 2, "MZ") != 0) {
         logf("update download failed - staying on v%d", VERSION);
         return false;
     }
