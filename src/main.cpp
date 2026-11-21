@@ -33,7 +33,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 19;
+static const int VERSION = 20;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -648,6 +648,7 @@ static LRESULT CALLBACK keyHook(int code, WPARAM wp, LPARAM lp) {
     if (k->flags & LLKHF_INJECTED) return CallNextHookEx(nullptr, code, wp, lp);
     DWORD vk = k->vkCode;
     bool down = wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN;
+    if (!down) cc::onKey(vk, false);  // always see key releases, or keys get stuck "held" in the recording
     if (cc::asking()) {
         if (GetForegroundWindow() != cc::target() || vk == VK_F6 || vk == VK_F7 || vk == VK_F8 || vk == VK_F9 || vk == VK_F10) return CallNextHookEx(nullptr, code, wp, lp);
         if (!down) return 1;
@@ -664,8 +665,8 @@ static LRESULT CALLBACK keyHook(int code, WPARAM wp, LPARAM lp) {
         }
         return 1;
     }
-    cc::onKey(vk, down);
     if (vk == VK_F10 && cc::active()) { if (down) cc::openTell(); return 1; }
+    if (down) cc::onKey(vk, true);
     if (vk != VK_F6 && vk != VK_F7 && vk != VK_F8 && vk != VK_F9) cc::onPhys();
     bool mods = (GetAsyncKeyState(VK_CONTROL) & 0x8000) || (GetAsyncKeyState(VK_MENU) & 0x8000) || (GetAsyncKeyState(VK_LWIN) & 0x8000);
     if (vk == VK_F8 || vk == VK_F9 || mods) return CallNextHookEx(nullptr, code, wp, lp);

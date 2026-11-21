@@ -98,7 +98,7 @@ static std::string keyName(int vk) {
 static bool hasKey(const uint8_t *k, int vk) { return k[vk >> 3] & (1 << (vk & 7)); }
 
 void onKey(DWORD vk, bool down) {
-    if (vk == VK_F6 || vk == VK_F7 || vk == VK_F8 || vk == VK_F9 || vk > 255) return;
+    if ((vk >= VK_F1 && vk <= VK_F24) || vk == VK_ESCAPE || vk == VK_LWIN || vk == VK_RWIN || vk > 255) return;
     uint64_t bit = 1ull << (vk & 63);
     if (down) keyBits[vk >> 6] |= bit; else keyBits[vk >> 6] &= ~bit;
 }
@@ -556,7 +556,9 @@ static void detThread() {
         }
         Rect r;
         if (!mode || mode == 3 || GetForegroundWindow() != tgt || !targetRect(r)) { det::hide(); Sleep(50); continue; }
-        if (!det::run(r, bs)) { det::hide(); Sleep(200); continue; }
+        { std::vector<det::Box> raw;
+          if (!det::run(r, raw)) { det::hide(); Sleep(200); continue; }
+          det::track(raw, bs); }
         n++;
         if (now() - lastSec >= 1) { det::rate = n / (now() - lastSec); n = 0; lastSec = now(); }
         std::vector<std::string> labels; std::vector<int> kind;
@@ -713,6 +715,12 @@ static void fileLoad() {
         if (n && fread(data.data(), sizeof(Frame), n, f) != n) data.clear();
         double base = now() - 1e6;
         for (auto &fr : data) fr.t += base;
+        size_t before = data.size();
+        data.erase(std::remove_if(data.begin(), data.end(), [](const Frame &fr) {
+            for (int vk = VK_F1; vk <= VK_F24; vk++) if (hasKey(fr.keys, vk)) return true;
+            return false;
+        }), data.end());
+        if (data.size() != before) logf("Copycat: removed %d frames recorded while F10 was stuck", (int)(before - data.size()));
         uint32_t np = 0;
         if (fread(&np, 4, 1, f) == 1 && np <= MAXPLACE)
             for (uint32_t i = 0; i < np; i++) { Place pl; if (fread(pl.c, sizeof pl.c, 1, f) != 1 || fread(&pl.n, 4, 1, f) != 1) break; uint8_t tmp[FD]; for (int k = 0; k < FD; k++) tmp[k] = (uint8_t)pl.c[k]; pl.look = lookOf(tmp); places.push_back(pl); }
@@ -940,6 +948,7 @@ static bool explain(const std::string &raw, int place) {
 }
 void openTell() {
     if (mode != 1 && mode != 2) return;
+    for (auto &b : keyBits) b = 0;
     resumeMode = (int)mode;
     telling = true;
     mode = 3;
@@ -948,6 +957,7 @@ void openTell() {
 }
 
 static void openAsk() {
+    for (auto &b : keyBits) b = 0;
     telling = false;
     mode = 3;
     releaseAll();
@@ -1103,6 +1113,7 @@ static void loop() {
                 confusedSince = 0;
                 mode = telling ? (int)resumeMode : 2;
                 telling = false;
+                for (auto &b : keyBits) b = 0;
             }
             continue;
         }

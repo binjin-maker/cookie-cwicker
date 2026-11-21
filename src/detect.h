@@ -144,7 +144,7 @@ static bool run(const Rect &r, std::vector<Box> &out) {
                 int best = 0; float bc = 0;
                 for (int c = 0; c < 80; c++) if (p[5 + c] > bc) { bc = p[5 + c]; best = c; }
                 float conf = obj * bc;
-                if (conf < 0.4f) continue;
+                if (conf < 0.45f) continue;
                 float cx = (p[0] + gx) * st, cy = (p[1] + gy) * st, bw = std::exp(p[2]) * st, bh = std::exp(p[3]) * st;
                 Box b{r.x0 + (int)((cx - bw / 2) / sc), r.y0 + (int)((cy - bh / 2) / sc), r.x0 + (int)((cx + bw / 2) / sc), r.y0 + (int)((cy + bh / 2) / sc), best, conf};
                 cand.push_back(b);
@@ -159,6 +159,36 @@ static bool run(const Rect &r, std::vector<Box> &out) {
         if (out.size() >= 20) break;
     }
     return true;
+}
+
+// ---- tracking: keeps boxes steady between frames instead of flickering ----
+struct Track { float x0, y0, x1, y1; int cls; float conf; int hits; double last; };
+static std::vector<Track> tracks;
+static void track(const std::vector<Box> &in, std::vector<Box> &out) {
+    double t = now();
+    std::vector<bool> used(tracks.size(), false);
+    for (auto &b : in) {
+        int best = -1; float bi = 0.25f;
+        for (size_t i = 0; i < tracks.size(); i++) {
+            if (used[i] || tracks[i].cls != b.cls) continue;
+            Box tb{(int)tracks[i].x0, (int)tracks[i].y0, (int)tracks[i].x1, (int)tracks[i].y1, b.cls, 0};
+            float v = iou(tb, b);
+            if (v > bi) { bi = v; best = (int)i; }
+        }
+        if (best >= 0) {
+            Track &k = tracks[best]; used[best] = true;
+            const float a = 0.45f;
+            k.x0 += (b.x0 - k.x0) * a; k.y0 += (b.y0 - k.y0) * a; k.x1 += (b.x1 - k.x1) * a; k.y1 += (b.y1 - k.y1) * a;
+            k.conf = k.conf * 0.6f + b.conf * 0.4f; k.hits++; k.last = t;
+        } else {
+            tracks.push_back({(float)b.x0, (float)b.y0, (float)b.x1, (float)b.y1, b.cls, b.conf, 1, t});
+            used.push_back(true);
+        }
+    }
+    tracks.erase(std::remove_if(tracks.begin(), tracks.end(), [t](const Track &k) { return t - k.last > 0.4; }), tracks.end());
+    out.clear();
+    for (auto &k : tracks)
+        if (k.hits >= 3 || (k.hits >= 2 && k.conf > 0.6f)) out.push_back({(int)k.x0, (int)k.y0, (int)k.x1, (int)k.y1, k.cls, k.conf});
 }
 
 // ---- overlay: boxes + labels drawn over the game (hidden from the bot's own screenshots) ----
