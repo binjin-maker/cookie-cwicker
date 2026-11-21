@@ -1246,6 +1246,10 @@ static std::vector<Cmd> parseScript(const std::string &raw, int defCls = -1) {
         auto has = [&](const char *w) { return p.find(w) != std::string::npos; };
         double n = -1; for (size_t i = 0; i < p.size(); i++) if (isdigit((unsigned char)p[i])) { n = atof(p.c_str() + i); break; }
         bool times = has(" times") || has(" time ") || has(" x ");
+        for (auto &tk : split(p))  // "x3" / "3x"
+            if (tk.size() >= 2 && ((tk[0] == 'x' && isdigit((unsigned char)tk[1])) || (tk.back() == 'x' && isdigit((unsigned char)tk[0])))) {
+                times = true; n = atof(tk[0] == 'x' ? tk.c_str() + 1 : tk.c_str());
+            }
         Cmd c;
         int cls = -1;
         for (int k = 0; k < 80; k++) {
