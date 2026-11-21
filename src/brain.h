@@ -42,6 +42,12 @@ static void fillCookie(std::vector<Layer> &L) {
 }
 
 static void fillCopycat(std::vector<Layer> &L) {
+    // read the key list BEFORE taking the brain lock (the bot thread takes them in the other order)
+    std::vector<std::pair<int, int>> usedKeys;
+    {
+        std::lock_guard<std::mutex> dl(cc::mu);
+        for (auto &kv : cc::keyStats) if (kv.first < 256 && kv.second.held > 5) usedKeys.push_back({kv.second.held, kv.first});
+    }
     std::lock_guard<std::mutex> lk(cc::bmu);
     L.push_back({"SEES", {"motion", "enemy", "objects", "movers", "target", "tool", "need", "you"}, std::vector<float>(cc::bIn, cc::bIn + 8)});
     L.push_back({"MEMORIES", {"memory 1", "memory 2", "memory 3", "memory 4", "memory 5", "memory 6"}, std::vector<float>(cc::bMem, cc::bMem + 6)});
@@ -49,11 +55,7 @@ static void fillCopycat(std::vector<Layer> &L) {
     // DOES: every key this game actually uses (most used first), mouse buttons and turning
     Layer out{"DOES", {}, {}};
     {
-        std::vector<std::pair<int, int>> used;
-        {
-            std::lock_guard<std::mutex> dl(cc::mu);
-            for (auto &kv : cc::keyStats) if (kv.first < 256 && kv.second.held > 5) used.push_back({kv.second.held, kv.first});
-        }
+        std::vector<std::pair<int, int>> used = usedKeys;
         std::sort(used.rbegin(), used.rend());
         if (used.empty()) for (int vk : {(int)'W', (int)'A', (int)'S', (int)'D', (int)VK_SPACE, (int)VK_SHIFT, (int)VK_CONTROL, (int)'E'}) used.push_back({0, vk});
         for (size_t i = 0; i < used.size() && i < 14; i++) { out.names.push_back(cc::keyName(used[i].second)); out.v.push_back(cc::outAll[used[i].second]); }
