@@ -1246,6 +1246,15 @@ static std::vector<Cmd> parseScript(const std::string &raw, int defCls = -1) {
         auto has = [&](const char *w) { return p.find(w) != std::string::npos; };
         double n = -1; for (size_t i = 0; i < p.size(); i++) if (isdigit((unsigned char)p[i])) { n = atof(p.c_str() + i); break; }
         bool times = has(" times") || has(" time ") || has(" x ");
+        // "500ms" / "500 ms" / "0.5s" -> seconds
+        {
+            bool ms = false;
+            for (auto &tk : split(p)) {
+                if (tk == "ms" || tk == "millisecond" || tk == "milliseconds") ms = true;
+                if (tk.size() > 2 && isdigit((unsigned char)tk[0]) && tk.compare(tk.size() - 2, 2, "ms") == 0) ms = true;
+            }
+            if (ms && n > 0) n /= 1000.0;
+        }
         for (auto &tk : split(p))  // "x3" / "3x"
             if (tk.size() >= 2 && ((tk[0] == 'x' && isdigit((unsigned char)tk[1])) || (tk.back() == 'x' && isdigit((unsigned char)tk[0])))) {
                 times = true; n = atof(tk[0] == 'x' ? tk.c_str() + 1 : tk.c_str());
@@ -1255,6 +1264,14 @@ static std::vector<Cmd> parseScript(const std::string &raw, int defCls = -1) {
         for (int k = 0; k < 80; k++) {
             std::string a = className(k), b = det::COCO[k];
             if (p.find(" " + a) != std::string::npos || p.find(" " + b) != std::string::npos) { cls = k; break; }
+        }
+        if (has(" hold ")) {
+            size_t q = p.find(" hold ") + 6; std::string w = p.substr(q); w = w.substr(0, w.find(' '));
+            Cmd h; h.type = C_HOLD; h.secs = n > 0 ? n : 1;
+            if (w == "right" || has(" right click") || has(" rmb") || w == "aim") h.btn = 2;
+            else if (w == "click" || w == "left" || w == "lmb" || w == "mouse" || w == "fire" || w == "shoot" || w == "attack") h.btn = 1;
+            else { int vk = vkFromWord(w); if (vk > 0 && vk < 256) h.vk = vk; else if (vk == 1001) h.btn = 1; else if (vk == 1002) h.btn = 2; }
+            if (h.btn || h.vk) { out.push_back(h); continue; }
         }
         if (cls < 0 && (has(" it ") || has(" them ") || has(" that ") || has(" one "))) cls = defCls;
         if ((has(" look at") || has(" face ") || has(" aim at") || has(" point at")) && cls >= 0) {
