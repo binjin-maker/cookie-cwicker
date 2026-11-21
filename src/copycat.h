@@ -931,8 +931,7 @@ static void saveRules() {
         for (int c = 0; c < 80; c++) if (classGood[c] || classBad[c]) fprintf(f, "class %d %d %d\n", c, classGood[c], classBad[c]);
         for (int c = 0; c < 80; c++) if (userClass[c]) fprintf(f, "userclass %d %d\n", c, userClass[c]);
         for (auto &kv : statOverride) fprintf(f, "statweight %g %s\n", kv.second, kv.first.c_str());
-        if (aimK > 0) fprintf(f, "camera %g %g\n", aimK, aimKy > 0 ? aimKy : aimK);  // measured while aiming beats measured while watching
-        else if (ppcX > 0) fprintf(f, "camera %g %g\n", ppcX, ppcY);
+        if (ppcX > 0) fprintf(f, "camera2 %g %g\n", ppcX, ppcY);
         for (int c = 0; c < 80; c++) if (!classAlias[c].empty()) fprintf(f, "alias %d %s\n", c, classAlias[c].c_str());
         fclose(f);
     }
@@ -999,7 +998,7 @@ static void loadRules() {
                 for (const char *w : {" run", " away", " when", " if ", " low", " health", " then", " shoot", " kill"}) if ((" " + a + " ").find(w) != std::string::npos) bad = true;
                 if (!bad) classAlias[v] = a; else logf("Copycat: dropped a broken name for %s (\"%s\")", det::COCO[v], nm);
             }
-            else { float wv, wy; if (sscanf(line, "statweight %f %259[^\n]", &wv, nm) == 2) statOverride[nm] = wv; else if (sscanf(line, "camera %f %f", &wv, &wy) == 2) { ppcX = wv; ppcY = wy; } }
+            else { float wv, wy; if (sscanf(line, "statweight %f %259[^\n]", &wv, nm) == 2) statOverride[nm] = wv; else if (sscanf(line, "camera2 %f %f", &wv, &wy) == 2) { ppcX = wv; ppcY = wy; }  // (old "camera" lines from v44 could be wrong: ignored) }
         }
     }
     fclose(f);
@@ -1251,8 +1250,8 @@ static void camTurnPixels(double px, double py, const std::string &why) {
 }
 static void camStep(int &mx, int &my) {
     if (std::fabs(camX) < 1 && std::fabs(camY) < 1) { if (camX != 0 || camY != 0) camDoneAt = now(); camX = camY = 0; return; }
-    double sx = std::max(-160.0, std::min(160.0, camX * 0.35 + (camX > 0 ? 2 : -2)));
-    double sy = std::max(-100.0, std::min(100.0, camY * 0.35 + (camY > 0 ? 1 : -1)));
+    double sx = std::max(-70.0, std::min(70.0, camX * 0.22 + (camX > 0 ? 2 : -2)));
+    double sy = std::max(-45.0, std::min(45.0, camY * 0.22 + (camY > 0 ? 1 : -1)));
     if (std::fabs(camX) < std::fabs(sx)) sx = camX;
     if (std::fabs(camY) < std::fabs(sy)) sy = camY;
     mx += (int)sx; my += (int)sy; camX -= (int)sx; camY -= (int)sy;
@@ -1262,71 +1261,101 @@ static void camStep(int &mx, int &my) {
 // cls -2 = "enemy": anything it counts as hostile
 static std::string tgtName(int cls) { return cls == -2 ? std::string("enemy") : cls >= 0 && cls < 80 ? className(cls) : std::string("thing"); }
 // aiming in mouse-count space: each detector frame says where the target was when that screenshot was taken;
-// add the moves sent since then and it knows where the target is NOW, so it can correct every frame without waiting.
-// it also tracks the target's speed and leads it, and learns px-per-count from its own moves.
+// add the moves sent since then and it knows where the target is now, so it corrects every frame, smoothly.
+// first it measures your sensitivity with one small test move (never guesses big), then keeps refining it.
 static struct AimState { int cls = -1; double lastShot = 0, Ax = 0, Ay = 0, vX = 0, vY = 0, tA = 0, ex = 1e9, ey = 1e9, prevCamX = 0, prevEx = 0;
-                         double lostSince = 0, lastSeen = 0, lastSearch = 0, errX = 0; int hits = 0; bool have = false; } aimS;
-static void aimReset(int cls) { aimS = AimState(); aimS.cls = cls; }
+                         double lostSince = 0, lastSeen = 0, lastSearch = 0, errX = 0, outX = 0, outY = 0, lastAbs = 1e9; int hits = 0, grow = 0; bool have = false; } aimS;
+static struct { int dir = 0, left = 0, size = 0; double ex = 0, cam = 0, doneAt = 0; } probe;
+static void aimReset(int cls) { aimS = AimState(); aimS.cls = cls; probe.dir = 0; probe.left = 0; }
 // 1 = on target, 0 = working on it, -1 = can't see it. adds this frame's mouse move to mx/my.
 static int aimStep(int cls, double offX, double offY, int &mx, int &my) {
     Rect r; if (!targetRect(r)) return -1;
     double W = r.x1 - r.x0, H = r.y1 - r.y0, cx = (r.x0 + r.x1) / 2.0, cy = (r.y0 + r.y1) / 2.0;
     if (aimS.cls != cls) aimReset(cls);
-    double kx = aimK > 0 ? aimK : ppcX > 0 ? ppcX : 1.0, ky = aimKy > 0 ? aimKy : ppcY > 0 ? ppcY : kx;
+    bool fresh = false; double ex = 0, ey = 0, camSx = 0, camSy = 0, shot = 0;
     {
         std::lock_guard<std::mutex> lk(mu);
         if (seenRawShot > aimS.lastShot) {
-            aimS.lastShot = seenRawShot;
-            double camSx, camSy; cumAt(seenRawShot - 0.02, camSx, camSy);  // ~1 frame of render lag
-            // where the last target should be on this screenshot
+            aimS.lastShot = shot = seenRawShot;
+            cumAt(shot - 0.02, camSx, camSy);  // ~1 frame of render lag
+            double kx = aimK > 0 ? aimK : 1, ky = aimKy > 0 ? aimKy : kx;
             double expX = cx + (aimS.Ax - camSx) * kx - offX, expY = cy + (aimS.Ay - camSy) * ky - offY;
             const Seen *best = nullptr; double bd = 1e18;
             for (auto &s2 : seenRaw) {
                 if (s2.own || (cls >= 0 && s2.cls != cls) || (cls == -2 && !s2.hostile)) continue;
+                if (s2.h < H * 0.025 || s2.conf < 0.55f) continue;  // tiny or unsure = usually a false positive
+                bool confirmed = false;  // must also be a steady tracked detection, not a one-frame flicker
+                for (auto &t2 : seenNow) if (t2.cls == s2.cls && std::abs(t2.cx - s2.cx) < std::max(t2.w, s2.w) / 2 && std::abs(t2.cy - s2.cy) < std::max(t2.h, s2.h) / 2) { confirmed = true; break; }
+                if (!confirmed) continue;
                 double d = aimS.have ? std::hypot(s2.cx - expX, s2.cy - expY) : std::hypot(s2.cx - cx, s2.cy - cy);
                 if (d < bd) { bd = d; best = &s2; }
             }
-            if (best && aimS.have && bd > W * 0.25 && now() - aimS.lastSeen < 0.4) best = nullptr;  // probably a different one - don't flick
-            if (best) {
-                double ex = best->cx + offX - cx, ey = best->cy + offY - cy;
-                // learn px per count: target roughly still, camera moved -> how far did it slide on screen
-                double dC = camSx - aimS.prevCamX;
-                if (aimS.have && std::fabs(dC) > 20 && std::fabs(aimS.vX) * (seenRawShot - aimS.tA) < 0.25 * std::fabs(dC)) {
-                    double kk = -(ex - aimS.prevEx) / dC;
-                    if (aimK > 0) kk = std::max(aimK * 0.5, std::min(aimK * 2, kk));
-                    if (kk > 0.02 && kk < 40) { aimK = aimK > 0 ? aimK * 0.75 + kk * 0.25 : kk; if (ppcX > 0 && ppcY > 0) aimKy = aimK * ppcY / ppcX; }
-                }
-                double Ax = camSx + ex / kx, Ay = camSy + ey / ky;
-                if (aimS.have) {
-                    double dt = seenRawShot - aimS.tA;
-                    if (dt > 0.02 && dt < 0.5) {
-                        double cap = W * 1.2 / kx;  // counts/s
-                        double nvx = std::max(-cap, std::min(cap, (Ax - aimS.Ax) / dt)), nvy = std::max(-cap, std::min(cap, (Ay - aimS.Ay) / dt)) * 0.5;
-                        bool ok = aimS.hits >= 2 && aimK > 0;  // speed is only trustworthy once px-per-count is measured
-                        aimS.vX = ok ? aimS.vX * 0.6 + nvx * 0.4 : 0; aimS.vY = ok ? aimS.vY * 0.6 + nvy * 0.4 : 0;
-                    }
-                }
-                aimS.Ax = Ax; aimS.Ay = Ay; aimS.tA = seenRawShot; aimS.ex = ex; aimS.ey = ey; aimS.errX = ex;
-                aimS.prevCamX = camSx; aimS.prevEx = ex; aimS.have = true; aimS.hits++; aimS.lastSeen = now(); aimS.lostSince = 0;
+            if (best && aimS.have && bd > W * 0.2 && now() - aimS.lastSeen < 0.5) best = nullptr;  // a different one - don't flick to it
+            if (best) { ex = best->cx + offX - cx; ey = best->cy + offY - cy; fresh = true; aimS.lastSeen = now(); aimS.lostSince = 0; }
+            else { if (aimS.lostSince == 0) aimS.lostSince = now(); aimS.vX *= 0.5; aimS.vY *= 0.5; }
+        }
+    }
+    if (fresh && aimK <= 0) {
+        // measure px per count: small move, see how far the target slides; bigger test only if it barely moved
+        if (probe.dir == 0) { if (probe.size <= 0) probe.size = 20; probe.dir = ex > 0 ? 1 : -1; probe.left = probe.size * probe.dir; probe.ex = ex; probe.cam = camSx; }
+        else if (probe.left == 0 && shot > probe.doneAt + 0.03) {
+            double dC = camSx - probe.cam, dE = ex - probe.ex;
+            if (std::fabs(dE) >= 12 && dE * dC < 0) {
+                aimK = std::fabs(dE / dC); aimKy = ppcX > 0 && ppcY > 0 ? aimK * ppcY / ppcX : aimK;
+                note("measured aim: 1 mouse count moves the view %.2f px", aimK);
             } else {
-                if (aimS.lostSince == 0) aimS.lostSince = now();
-                aimS.vX *= 0.5; aimS.vY *= 0.5;
+                probe.size *= 3;
+                if (probe.size > 600) { aimK = ppcX > 0 ? ppcX : 1.0; aimKy = ppcY > 0 ? ppcY : aimK; note("couldn't measure aim speed - using %.2f px per count", aimK); }
+                else { probe.dir = ex > 0 ? 1 : -1; probe.left = probe.size * probe.dir; probe.ex = ex; probe.cam = camSx; }
             }
         }
     }
-    if (!aimS.have || now() - aimS.lastSeen > 1.0) return -1;
+    if (fresh && aimK > 0) {
+        double dC = camSx - aimS.prevCamX;
+        if (aimS.have && std::fabs(dC) * aimK > W * 0.03 && std::fabs(aimS.vX) * (shot - aimS.tA) < 0.25 * std::fabs(dC)) {
+            double kk = std::max(aimK / 1.3, std::min(aimK * 1.3, -(ex - aimS.prevEx) / dC));
+            aimK = aimK * 0.8 + kk * 0.2; if (ppcX > 0 && ppcY > 0) aimKy = aimK * ppcY / ppcX; else aimKy = aimK;
+        }
+        // error growing frame after frame = it's overshooting: trust a bigger px-per-count
+        if (aimS.have && std::fabs(ex) > aimS.lastAbs * 1.1 && std::fabs(ex) > W * 0.02) { if (++aimS.grow >= 2) { aimK *= 1.4; aimKy *= 1.4; aimS.grow = 0; } }
+        else aimS.grow = 0;
+        aimS.lastAbs = std::fabs(ex);
+        double kx = aimK, ky = aimKy > 0 ? aimKy : aimK;
+        double Ax = camSx + ex / kx, Ay = camSy + ey / ky;
+        if (aimS.have) {
+            double dt = shot - aimS.tA;
+            if (dt > 0.02 && dt < 0.5) {
+                double cap = W * 0.6 / kx;
+                double nvx = std::max(-cap, std::min(cap, (Ax - aimS.Ax) / dt)), nvy = std::max(-cap, std::min(cap, (Ay - aimS.Ay) / dt)) * 0.5;
+                bool ok = aimS.hits >= 3;
+                aimS.vX = ok ? aimS.vX * 0.7 + nvx * 0.3 : 0; aimS.vY = ok ? aimS.vY * 0.7 + nvy * 0.3 : 0;
+            }
+        }
+        aimS.Ax = Ax; aimS.Ay = Ay; aimS.tA = shot; aimS.ex = ex; aimS.ey = ey; aimS.errX = ex;
+        aimS.prevCamX = camSx; aimS.prevEx = ex; aimS.have = true; aimS.hits++;
+    }
+    if (aimS.lastSeen == 0 || now() - aimS.lastSeen > 1.0) return -1;
+    if (aimK <= 0) {  // doing the test move
+        if (probe.left != 0) {
+            int lim = probe.size < 60 ? 10 : 60, st = std::max(-lim, std::min(lim, probe.left));
+            mx += st; probe.left -= st;
+            if (probe.left == 0) probe.doneAt = now();
+        }
+        return 0;
+    }
+    if (!aimS.have) return 0;
+    if (now() - aimS.lastSeen > 0.4) { aimS.outX = aimS.outY = 0; return 0; }  // lost for a moment: hold still
+    double kx = aimK, ky = aimKy > 0 ? aimKy : aimK;
     double nowX, nowY; cumAt(now(), nowX, nowY);
-    double lead = std::min(0.3, now() - aimS.tA) + 0.05;
+    double lead = std::min(0.2, now() - aimS.tA) + 0.03;
     double ecx = aimS.Ax + aimS.vX * lead - nowX, ecy = aimS.Ay + aimS.vY * lead - nowY;  // counts still to go
-    double epx = ecx * kx, epy = ecy * ky;
-    bool fresh = now() - aimS.lastSeen < 0.25;
-    if (fresh && std::fabs(epx) < W * 0.015 && std::fabs(epy) < H * 0.025 && std::fabs(aimS.ex) < W * 0.03 && std::fabs(aimS.ey) < H * 0.04) return 1;
-    double g = aimK > 0 ? 0.5 : 0.25;                       // part of the gap per frame (30/s); careful until measured
-    double capX = W * 0.15 / kx, capY = H * 0.15 / ky;      // per-frame limit
-    int sx = (int)std::lround(std::max(-capX, std::min(capX, ecx * g))), sy = (int)std::lround(std::max(-capY, std::min(capY, ecy * g)));
-    if (std::fabs(ecx) >= 1 && sx == 0) sx = ecx > 0 ? 1 : -1;
-    if (std::fabs(ecy) >= 1 && sy == 0) sy = ecy > 0 ? 1 : -1;
-    if (!fresh && now() - aimS.lastSeen > 0.4) return 0;  // lost for a moment: hold, don't drift
+    if (std::fabs(ecx * kx) < W * 0.012 && std::fabs(ecy * ky) < H * 0.02 && std::fabs(aimS.ex) < W * 0.025 && std::fabs(aimS.ey) < H * 0.035) { aimS.outX = aimS.outY = 0; return 1; }
+    double capX = W * 0.035 / kx, capY = H * 0.035 / ky;  // per-frame limit in screen terms: smooth, never a snap
+    double cmdX = std::max(-capX, std::min(capX, ecx * 0.3)), cmdY = std::max(-capY, std::min(capY, ecy * 0.3));
+    aimS.outX = aimS.outX * 0.45 + cmdX * 0.55; aimS.outY = aimS.outY * 0.45 + cmdY * 0.55;
+    int sx = (int)std::lround(aimS.outX), sy = (int)std::lround(aimS.outY);
+    if (sx == 0 && std::fabs(ecx) >= 1) sx = ecx > 0 ? 1 : -1;
+    if (sy == 0 && std::fabs(ecy) >= 1) sy = ecy > 0 ? 1 : -1;
     mx += sx; my += sy;
     return 0;
 }
@@ -2439,6 +2468,7 @@ void start(int m) {
     if (!fg || fg == gPanel) { logf("Copycat: click the game window first, then press F6/F7"); return; }
     if (worker.joinable()) worker.join();
     tgt = fg;
+    aimK = aimKy = 0; probe.dir = probe.left = probe.size = 0;  // re-measure aim speed each session
     std::string n = exeOf(fg);
     if (n != name || data.empty()) {
         name = n; fileLoad();

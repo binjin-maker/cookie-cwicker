@@ -150,7 +150,7 @@ static bool run(const Rect &r, std::vector<Box> &out) {
                 int best = 0; float bc = 0;
                 for (int c = 0; c < 80; c++) if (p[5 + c] > bc) { bc = p[5 + c]; best = c; }
                 float conf = obj * bc;
-                if (conf < 0.45f) continue;
+                if (conf < 0.5f) continue;
                 float cx = (p[0] + gx) * st, cy = (p[1] + gy) * st, bw = std::exp(p[2]) * st, bh = std::exp(p[3]) * st;
                 Box b{r.x0 + (int)((cx - bw / 2) / sc), r.y0 + (int)((cy - bh / 2) / sc), r.x0 + (int)((cx + bw / 2) / sc), r.y0 + (int)((cy + bh / 2) / sc), best, conf};
                 cand.push_back(b);

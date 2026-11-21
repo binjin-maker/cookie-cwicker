@@ -174,7 +174,7 @@ if see a cow then look at it => if looking at cow then hit 3 times => press e
 
 `looking at <thing>` is true when the crosshair is inside that thing's detection box (`looking at enemy` = any enemy). Explained rules about things on screen (`see`, `enemy`, `looking at`) can fire again after 1.5 s. Recorded ones wait 10 s.
 
-**Aiming:** `look at` / `aim at` correct the aim every frame (30/s). Each detector frame says where the target was when that screenshot was taken, and it adds the mouse moves sent since then, so it never waits for the camera to settle. It leads moving targets, learns how far one mouse count turns the view (saved per game), and keeps tracking through the next shoot / hold / wait steps. If it loses the target it holds still briefly, then sweeps toward where it was last seen.
+**Aiming:** `look at` / `aim at` correct the aim every frame (30/s), smoothly: each frame moves at most ~3.5% of the screen. Each detector frame says where the target was when that screenshot was taken, and it adds the mouse moves sent since then. The first time it aims in a session it makes one small test move to measure your mouse sensitivity, then keeps refining it, so it never flings the camera on a guess. It leads moving targets and keeps tracking through the next shoot / hold / wait steps. It only aims at steady, confident detections (no one-frame flickers, tiny boxes or low-confidence ones). If it loses the target it holds still briefly, then sweeps toward where it was last seen.
 
 **Tasks take over:** while a task runs, nothing else moves the controls (no memory copying, camera wandering or hotbar switching). On-screen rules (`see`, `enemy`, `looking at`) start again as soon as they finish if their condition is still true.
 
