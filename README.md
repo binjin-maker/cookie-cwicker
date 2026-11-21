@@ -144,6 +144,24 @@ Press **F10**, type, **Enter**. Everything is saved per game in `copycat\<game>.
 | `don't press e` / `never click` / `you can press e` | Key bans |
 | `ask me` / `don't ask` | Whether it may ask "What are you doing?" when lost (off by default) |
 
+### Control commands
+
+|You type|Effect|
+|-|-|
+|`stop` / `cancel`|Stops the running task|
+|`pause tasks` / `resume tasks`|Turns all tasks off / on|
+|`tasks only` / `copy me`|Stops / restarts copying your recordings. With tasks only, it runs tasks and otherwise waits|
+|`list tasks`|Writes every task to the Output|
+|`delete task flee` / `delete task all`|Removes tasks|
+|`look level` / `this is level`|Levels the camera / sets the current view as level|
+|`aim speed 1.5` / `aim speed fast` / `slow` / `normal`|Aiming speed (0.3 to 3)|
+
+**Smarter conditions:** `and` combines conditions, and `not` / `no` / `unless` flips one, e.g. `if health < 30% and no enemy then press 4`. `%` means percent of the highest value it has seen. Number words work (`three times`, `half a second`, `twice`), and `aim down sights` / `ads` means hold right mouse.
+
+**Priorities:** a number emergency (like `health < 30`) interrupts a task about something on screen (like shooting).
+
+**No more staring at the floor:** it tracks how far the view is tilted up or down. When nothing needs the view tilted, it eases back to level and won't let replayed memories tilt it further. It assumes you start each session looking level.
+
 ### Camera commands (while it plays)
 `look at 800 400` (screen pixels; the HUD **WHERE** row shows positions) · `turn left 90` · `turn right 30` · `turn around` · `look up 20` · `look at the bear` / `look at the person`.
 

@@ -45,6 +45,8 @@ struct Memory { uint8_t f[FD]; std::string text; };
 
 std::atomic<const char *> stepLoop{"-"}, stepOcr{"-"}, stepHud{"-"};
 std::atomic<int> mode{0};
+static double aimSpeed = 1.0;  // F10 "aim speed 1.5"
+static double pitchY = 0;      // mouse counts up/down from level (+ = looking down)
 static double ppcX = 0, ppcY = 0, aimK = 0, aimKy = 0;  // aimK: px per count measured from its own aiming moves    // screen pixels the view moves per mouse count (learned)  // 0 off, 1 watching, 2 copying, 3 asking
 std::atomic<bool> takeover{false};
 HWND tgt = nullptr;
@@ -1360,8 +1362,9 @@ static int aimStep(int cls, double offX, double offY, int &mx, int &my) {
     double lead = std::min(0.2, now() - aimS.tA) + 0.03;
     double ecx = aimS.Ax + aimS.vX * lead - nowX, ecy = aimS.Ay + aimS.vY * lead - nowY;  // counts still to go
     if (std::fabs(ecx * kx) < W * 0.012 && std::fabs(ecy * ky) < H * 0.02 && std::fabs(aimS.ex) < W * 0.025 && std::fabs(aimS.ey) < H * 0.035) { aimS.outX = aimS.outY = 0; return 1; }
-    double capX = W * 0.035 / kx, capY = H * 0.035 / ky;  // per-frame limit in screen terms: smooth, never a snap
-    double cmdX = std::max(-capX, std::min(capX, ecx * 0.3)), cmdY = std::max(-capY, std::min(capY, ecy * 0.3));
+    double capX = W * 0.035 * aimSpeed / kx, capY = H * 0.035 * aimSpeed / ky;  // per-frame limit in screen terms: smooth, never a snap
+    double gn = std::min(0.6, 0.3 * aimSpeed);
+    double cmdX = std::max(-capX, std::min(capX, ecx * gn)), cmdY = std::max(-capY, std::min(capY, ecy * gn));
     aimS.outX = aimS.outX * 0.45 + cmdX * 0.55; aimS.outY = aimS.outY * 0.45 + cmdY * 0.55;
     int sx = (int)std::lround(aimS.outX), sy = (int)std::lround(aimS.outY);
     if (sx == 0 && std::fabs(ecx) >= 1) sx = ecx > 0 ? 1 : -1;
@@ -1391,7 +1394,11 @@ struct Task {
     std::string what; double num = -1;
     std::vector<Step> steps;
     double lastRun = -1e9; int runs = 0;
+    bool neg = false, pct = false;  // "no enemy" / "not looking at", "health below 30%"
+    std::vector<Task> also;         // "... and ..." conditions that must all be true
 };
+static bool tasksOn = true, copyMem = true;  // F10 "pause tasks" / "tasks only"
+
 static std::vector<Task> tasks;
 static int teaching = -1;          // task being recorded
 static double teachStart = 0;
@@ -1400,6 +1407,21 @@ static std::string taskWhy;
 
 static void parseWhen(Task &k);
 static std::vector<Cmd> parseSteps(const std::string &raw, int defCls);
+// "three times", "half a second", "twice", "aim down sights" -> words the parsers already know
+static std::string normalizeWords(std::string t) {
+    t = " " + t + " ";
+    static const char *pairs[][2] = {
+        {" half a second ", " 0.5 s "}, {" half a sec ", " 0.5 s "}, {" a second ", " 1 s "}, {" a sec ", " 1 s "}, {" a moment ", " 0.5 s "}, {" a bit ", " 1 s "},
+        {" once ", " 1 times "}, {" twice ", " 2 times "}, {" thrice ", " 3 times "}, {" a couple of ", " 2 "}, {" a couple ", " 2 "}, {" a few ", " 3 "},
+        {" half ", " 0.5 "}, {" one ", " 1 "}, {" two ", " 2 "}, {" three ", " 3 "}, {" four ", " 4 "}, {" five ", " 5 "}, {" six ", " 6 "}, {" seven ", " 7 "},
+        {" eight ", " 8 "}, {" nine ", " 9 "}, {" ten ", " 10 "}, {" fifteen ", " 15 "}, {" twenty ", " 20 "}, {" thirty ", " 30 "}, {" fifty ", " 50 "},
+        {" hundred ", " 100 "}, {" aim down sights ", " hold rmb "}, {" aim down sight ", " hold rmb "}, {" ads ", " hold rmb "}, {" scope in ", " hold rmb "},
+        {" spam click ", " click x10 "}, {" spam ", " press "}, {" percent ", " % "}, {" is less than ", " < "}, {" is more than ", " > "},
+        {" is under ", " < "}, {" is over ", " > "}, {" seconds ", " s "}, {" second ", " s "}, {" secs ", " s "}};
+    for (int pass = 0; pass < 2; pass++)
+        for (auto &pr : pairs) { size_t q; while ((q = t.find(pr[0])) != std::string::npos) t.replace(q, strlen(pr[0]), pr[1]); }
+    return t.substr(1, t.size() - 2);
+}
 // "aim at person => if looking at enemy then hold lmb for 200ms": each => part runs after the one before it,
 // and only if its own if/when is true by then (otherwise the rest of the chain is skipped)
 static std::vector<Cmd> parseScript(const std::string &raw, int defCls = -1) {
@@ -1431,7 +1453,7 @@ static std::vector<Cmd> parseScript(const std::string &raw, int defCls = -1) {
 }
 static std::vector<Cmd> parseSteps(const std::string &raw, int defCls) {
     std::vector<Cmd> out;
-    std::string t = " " + lower(raw) + " ";
+    std::string t = " " + normalizeWords(lower(raw)) + " ";
     for (auto &c : t) if (!isalnum((unsigned char)c) && c != ' ' && c != ',' && c != '-') c = ' ';
     // "aim away from enemy and hold w and shift": " and " starts a new step only before an action word
     for (const char *v : {"aim", "look", "turn", "face", "hold", "press", "tap", "walk", "run", "sprint", "move", "go", "click", "hit", "attack", "shoot", "jump", "crouch",
@@ -1537,7 +1559,25 @@ static std::vector<Cmd> parseSteps(const std::string &raw, int defCls) {
     }
     return out;
 }
+static void parseWhen1(Task &k);
+// "if health < 30% and no enemy": split on "and", each part may be negated
 static void parseWhen(Task &k) {
+    k.also.clear(); k.neg = false; k.pct = false;
+    std::string w = " " + normalizeWords(lower(k.when)) + " ";
+    std::vector<std::string> parts;
+    { size_t q; std::string rest = w; while ((q = rest.find(" and ")) != std::string::npos) { parts.push_back(rest.substr(0, q) + " "); rest = " " + rest.substr(q + 5); } parts.push_back(rest); }
+    for (size_t i = 0; i < parts.size(); i++) {
+        std::string pt = parts[i]; bool neg = false;
+        for (const char *nw : {" not ", " no ", " isn t ", " isnt ", " unless ", " don t ", " dont ", " can t ", " cant ", " nothing "}) {
+            size_t q; while ((q = pt.find(nw)) != std::string::npos) { neg = !neg; pt.replace(q, strlen(nw), " "); }
+        }
+        if (pt.find(" nothing ") != std::string::npos) neg = true;
+        Task q; q.when = pt; parseWhen1(q); q.neg = neg;
+        if (i == 0) { k.kind = q.kind; k.what = q.what; k.num = q.num; k.neg = q.neg; k.pct = q.pct; }
+        else if (q.kind) k.also.push_back(q);
+    }
+}
+static void parseWhen1(Task &k) {
     std::string t = " " + k.when + " ";
     auto num = [&](size_t from) { for (size_t i = from; i < t.size(); i++) if (isdigit((unsigned char)t[i])) return atof(t.c_str() + i); return -1.0; };
     size_t p;
@@ -1567,7 +1607,7 @@ static void parseWhen(Task &k) {
     bool high = (t.find('>') != std::string::npos && !low) || t.find(" high") != std::string::npos || t.find(" above") != std::string::npos || t.find(" over ") != std::string::npos ||
                 t.find(" full") != std::string::npos || t.find(" more than") != std::string::npos;
     if (low || high) {
-        k.kind = low ? 1 : 2; k.num = num(0);
+        k.kind = low ? 1 : 2; k.num = num(0); k.pct = t.find('%') != std::string::npos;
         static const char *skipw[] = {"when", "if", "on", "of", "in", "my", "is", "the", "gets", "get", "low", "below", "under", "drops", "high", "above", "over", "full", "less", "more",
                                       "than", "empty", "it", "i", "m", "am", "you", "are", "bar", "meter"};
         auto toks = split(t);
@@ -1593,12 +1633,20 @@ static bool taskDue(Task &k, std::string &why) {
     if (t - k.lastRun < gap) return false;
     return condNow(k, why);
 }
+static bool condNow1(Task &k, std::string &why);
 static bool condNow(Task &k, std::string &why) {
+    bool r = k.kind == 0 ? true : condNow1(k, why);
+    if (k.neg && k.kind) { r = !r; why = r ? "no " + (k.what.empty() ? std::string("enemy") : k.what) : why; }
+    if (!r) return false;
+    for (auto &q : k.also) { std::string w2; if (!condNow(q, w2)) return false; if (!w2.empty()) why += ", " + w2; }
+    return true;
+}
+static bool condNow1(Task &k, std::string &why) {
     double t = now();
     if (k.kind == 1 || k.kind == 2) {
         for (auto &st : stats) {
             if (st.seen < 2 || st.label.find(k.what) == std::string::npos) continue;
-            double th = k.num >= 0 ? k.num : st.maxSeen * (k.kind == 1 ? 0.4 : 0.9);
+            double th = k.num >= 0 ? (k.pct ? st.maxSeen * k.num / 100.0 : k.num) : st.maxSeen * (k.kind == 1 ? 0.4 : 0.9);
             if (k.kind == 1 ? st.last < th : st.last > th) { why = st.label + " is " + fmtNum(st.last); return true; }
         }
         return false;
@@ -1672,6 +1720,53 @@ static bool taskCommand(const std::string &raw) {
     std::string t = lower(raw);
     for (auto &c : t) if (!isalnum((unsigned char)c) && c != ' ') c = ' ';
     std::string tt = " " + t + " ";
+    // ---- control commands ----
+    if (teaching < 0 && (tt == " stop " || tt == " stop task " || tt == " stop that " || tt == " cancel " || tt == " stop it " || tt == " abort ")) {
+        if (runningTask >= 0) { tasks[runningTask].lastRun = now(); note("stopped task \"%s\"", tasks[runningTask].name.c_str()); }
+        runningTask = -1; plan.until = 0; camX = camY = 0; camForced = false; forceAimCls = -1;
+        return true;
+    }
+    if (tt.find(" pause tasks ") != std::string::npos || tt.find(" tasks off ") != std::string::npos || tt.find(" no tasks ") != std::string::npos) {
+        tasksOn = false; runningTask = -1; note("tasks paused (\"resume tasks\" to turn them back on)"); return true;
+    }
+    if (tt.find(" resume tasks ") != std::string::npos || tt.find(" tasks on ") != std::string::npos || tt.find(" unpause tasks ") != std::string::npos) {
+        tasksOn = true; note("tasks on"); return true;
+    }
+    if (tt.find(" tasks only ") != std::string::npos || tt.find(" only tasks ") != std::string::npos || tt.find(" only do tasks ") != std::string::npos ||
+        tt.find(" stop copying ") != std::string::npos || tt.find(" don t copy ") != std::string::npos || tt.find(" dont copy ") != std::string::npos) {
+        copyMem = false; note("tasks only: it won't copy your recordings, just runs tasks and waits (\"copy me\" to undo)"); return true;
+    }
+    if (tt.find(" copy me ") != std::string::npos || tt.find(" copy me again ") != std::string::npos || tt.find(" use memory ") != std::string::npos) {
+        copyMem = true; note("copying your recordings again"); return true;
+    }
+    if (tt.find(" this is level ") != std::string::npos || tt.find(" this is straight ") != std::string::npos) { pitchY = 0; note("ok - this is level"); return true; }
+    if (tt.find(" look level ") != std::string::npos || tt.find(" level out ") != std::string::npos || tt.find(" look straight ") != std::string::npos ||
+        tt.find(" look forward ") != std::string::npos || tt.find(" look ahead ") != std::string::npos || tt.find(" stop looking at the floor ") != std::string::npos) {
+        camX = 0; camY = -pitchY; camForced = true; forceAimCls = -1; note("leveling the camera"); return true;
+    }
+    {
+        size_t q = tt.find(" aim speed ");
+        if (q != std::string::npos) {
+            double v = atof(tt.c_str() + q + 11);
+            if (tt.find(" fast", q) != std::string::npos) v = 1.6; else if (tt.find(" slow", q) != std::string::npos) v = 0.6; else if (tt.find(" normal", q) != std::string::npos) v = 1.0;
+            if (v > 0) { aimSpeed = std::max(0.3, std::min(3.0, v)); note("aim speed %.1fx", aimSpeed); return true; }
+        }
+    }
+    if (tt.find(" list tasks ") != std::string::npos || tt.find(" show tasks ") != std::string::npos || tt.find(" what tasks ") != std::string::npos) {
+        if (tasks.empty()) note("no tasks yet");
+        for (auto &k : tasks) note("task \"%s\": %s, %s", k.name.c_str(), k.when.empty() ? "when asked" : k.when.c_str(), !k.cmds.empty() ? k.script.c_str() : "recorded");
+        note("tasks are %s, copying recordings is %s", tasksOn ? "on" : "paused", copyMem ? "on" : "off");
+        return true;
+    }
+    for (const char *ph : {" delete task ", " forget task ", " remove task ", " delete rule ", " remove rule "}) {
+        size_t q = tt.find(ph);
+        if (q == std::string::npos) continue;
+        std::string nm = tt.substr(q + strlen(ph)); while (!nm.empty() && nm.back() == ' ') nm.pop_back();
+        if (nm == "all" || nm == "everything" || nm == "s") { runningTask = -1; tasks.clear(); saveTasks(); note("deleted all tasks"); return true; }
+        for (size_t i = 0; i < tasks.size(); i++)
+            if (lower(tasks[i].name) == nm) { runningTask = -1; note("deleted task \"%s\"", tasks[i].name.c_str()); tasks.erase(tasks.begin() + i); saveTasks(); return true; }
+        note("no task called \"%s\" (\"list tasks\" shows them)", nm.c_str()); return true;
+    }
     if (tt.find(" don t ask") != std::string::npos || tt.find(" dont ask") != std::string::npos || tt.find(" stop asking") != std::string::npos ||
         tt.find(" no questions") != std::string::npos || tt.find(" quiet") != std::string::npos) {
         askAllowed = false; note("ok - won't ask what you're doing anymore (F10 \"ask me\" to turn it back on)"); return true;
@@ -2008,7 +2103,8 @@ static void runQueuedScript() {
         if (taskCommand(ln)) continue;
         int pl = -1;
         { std::lock_guard<std::mutex> lk(mu); if (!data.empty()) pl = data.back().place; }
-        if (!explain(ln, pl)) note("didn't understand: %s", ln.c_str());
+        if (!explain(ln, pl))
+            note("didn't understand \"%s\" - try: if <condition> then <steps> / set task NAME if ... then ... / person is enemy / look at the bear / do NAME / list tasks", ln.c_str());
     }
 }
 static void loop() {
@@ -2032,10 +2128,11 @@ static void loop() {
             static double lastNote = 0;
             releaseAll();
             if (mode == 2 && now() - lastNote > 20) { note("paused while you're in the editor - click the game to continue"); lastNote = now(); }
+            rawDx = 0; rawDy = 0;
             Sleep(30); continue;
         }
         if (fgw != tgt) {
-            releaseAll();
+            releaseAll(); rawDx = 0; rawDy = 0;
             if (mode == 2 && !takeover) { note("the game isn't in front anymore - stopped playing for safety"); logf("Copycat stopped: game window lost focus"); mode = 0; break; }
             continue;
         }
@@ -2113,6 +2210,7 @@ static void loop() {
 
         Frame fr{}; memcpy(fr.f, f, FD); memcpy(fr.thumb, th, TN); fr.t = now();
         int dxr = rawDx.exchange(0), dyr = rawDy.exchange(0);
+        pitchY += dyr;
         if (watching) {
             for (int i = 0; i < 4; i++) { uint64_t b = keyBits[i]; memcpy(fr.keys + i * 8, &b, 8); }
             fr.btn = (uint8_t)btnState; fr.dx = (int16_t)std::max(-3000, std::min(3000, dxr)); fr.dy = (int16_t)std::max(-3000, std::min(3000, dyr));
@@ -2152,8 +2250,18 @@ static void loop() {
                 mode = 0; break;
             }
             bool planOn = now() < plan.until && !plan.show;
-            if (runningTask < 0 && !planOn)
+            if (runningTask < 0 && !planOn && tasksOn)
                 for (size_t i = 0; i < tasks.size(); i++) { std::string why; if (taskDue(tasks[i], why)) { runningTask = (int)i; runStep = 0; taskWhy = why; note("doing task \"%s\" (%s)", tasks[i].name.c_str(), why.c_str()); break; } }
+            // a number emergency (health low...) interrupts a task about something on screen
+            if (runningTask >= 0 && tasksOn && (tasks[runningTask].kind < 1 || tasks[runningTask].kind > 2))
+                for (size_t i = 0; i < tasks.size(); i++) {
+                    if ((int)i == runningTask || (tasks[i].kind != 1 && tasks[i].kind != 2)) continue;
+                    std::string why;
+                    if (taskDue(tasks[i], why)) {
+                        note("interrupting \"%s\" - %s", tasks[runningTask].name.c_str(), why.c_str());
+                        tasks[runningTask].lastRun = now(); runningTask = (int)i; runStep = 0; taskWhy = why; releaseAll(); break;
+                    }
+                }
             static size_t cmdIdx = 0; static double cmdStart = 0; static int cmdCount = 0; static bool cmdInit = false; static int lastLookCls = -1;
             static int lastRunning = -2;
             static int trackCls = -1; static double trackOX = 0, trackOY = 0;  // keep the aim on it while the next steps fire
@@ -2291,7 +2399,8 @@ static void loop() {
                 static long clipIdx = -1; static int clipLeft = 0; static size_t clipGen = 0;
                 bool repick = clipLeft <= 0 || clipIdx < 0 || clipGen != eraseGen;
                 if (!repick) { std::lock_guard<std::mutex> lk(mu); repick = clipIdx >= (long)data.size() || dist(f, data[clipIdx].f) > dRef * 2.6; }
-                if (repick || frames % 30 == 0) {
+                if (!copyMem) { clipIdx = -1; repick = false; }
+                else if (repick || frames % 30 == 0) {
                     long p = decide(f, th);
                     if (repick) { clipIdx = p; clipLeft = 24; clipGen = eraseGen; }
                 }
@@ -2392,6 +2501,20 @@ static void loop() {
                 bDrv[0] = sigEnemy; bDrv[1] = std::max(sigResource, wantTool > 0 ? 0.6f : 0.f); bDrv[2] = sigNeed;
                 bDrv[3] = sigGood; bDrv[4] = sigBad; bDrv[5] = planOn ? 1.f : 0.f;
                 bDrv[6] = (float)std::min(1.0, confusion / 3.0); bDrv[7] = std::max(0.f, 1.f - bDrv[6] - bDrv[0] * 0.5f);
+            }
+            // don't end up staring at the floor/sky: drift back to level when nothing needs the view up or down
+            if (!taskOn && !camForced) {
+                static double offSince = 0;
+                Rect pr; double Hh = targetRect(pr) ? pr.y1 - pr.y0 : 1080;
+                double ky = aimKy > 0 ? aimKy : ppcY > 0 ? ppcY : 1.0, thr = Hh * 0.15 / ky;
+                if (std::fabs(pitchY) > thr) { if (offSince == 0) offSince = now(); } else offSince = 0;
+                if (std::fabs(pitchY) > thr * 2.5 && (double)my * pitchY > 0) my = 0;  // memory can't push it further off
+                if (offSince && now() - offSince > (copyMem ? 1.5 : 0.3)) {
+                    int c = (int)std::lround(std::max(-25.0, std::min(25.0, -pitchY * 0.08)));
+                    if (c == 0) c = pitchY > 0 ? -1 : 1;
+                    my += c;
+                    static double lastLvl = 0; if (now() - lastLvl > 30) { note("looking %s too long - leveling out", pitchY > 0 ? "down" : "up"); lastLvl = now(); }
+                }
             }
             stepLoop = "press keys";
             applyOut(ko, b);
@@ -2531,6 +2654,7 @@ void start(int m) {
     if (worker.joinable()) worker.join();
     tgt = fg;
     aimK = aimKy = 0; probe.dir = probe.left = probe.size = 0;  // re-measure aim speed each session
+    pitchY = 0;  // assume you start looking level ("this is level" to reset)
     std::string n = exeOf(fg);
     if (n != name || data.empty()) {
         name = n; fileLoad();
