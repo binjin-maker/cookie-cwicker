@@ -21,6 +21,7 @@
 #include <ctime>
 #include "logic.h"
 #include <climits>
+#include <sstream>
 
 using namespace ABI::Windows::Storage::Streams;
 
@@ -32,7 +33,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 18;
+static const int VERSION = 19;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -1775,6 +1776,7 @@ static void renderHud() {
     pushLayered(gHudWnd, hx, hy, W, H, bg.data(), gHudDrag);
 }
 
+#include "detect.h"
 #include "copycat.h"
 
 // ================= control panel window =================
@@ -2116,8 +2118,38 @@ static bool checkUpdate(bool manual) {
     return true;
 }
 
+// extra files (object detector) that live next to the exe; stored in the repo with .dl_ so browsers don't block them
+static void fetchExtras() {
+    std::string sha, base = REPO_RAW;
+    if (httpGet("https://api.github.com/repos/binjin-maker/cookie-cwicker/commits/main", sha, 128, "Accept: application/vnd.github.sha\r\n")) {
+        while (!sha.empty() && isspace((unsigned char)sha.back())) sha.pop_back();
+        if (sha.size() == 40) base = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/" + sha + "/";
+    }
+    std::string list;
+    if (!httpGet(base + "extras.txt", list, 4096)) return;
+    std::wstring dir = gSelf.substr(0, gSelf.find_last_of(L"\\/") + 1);
+    std::istringstream in(list);
+    std::string remote, local; long long size;
+    while (in >> remote >> local >> size) {
+        std::wstring lp = dir + std::wstring(local.begin(), local.end());
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        if (GetFileAttributesExW(lp.c_str(), GetFileExInfoStandard, &fa) && (((long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) == size) continue;
+        logf("downloading %s (%.1f MB) for the object detector...", local.c_str(), size / 1048576.0);
+        std::string data;
+        if (!httpGet(base + remote, data, (size_t)size + 1024) || (long long)data.size() != size) { logf("couldn't download %s - will retry later", local.c_str()); continue; }
+        std::wstring tmp = lp + L".part";
+        HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        DWORD w = 0; bool okw = WriteFile(f, data.data(), (DWORD)data.size(), &w, nullptr) && w == data.size();
+        CloseHandle(f);
+        if (okw && MoveFileExW(tmp.c_str(), lp.c_str(), MOVEFILE_REPLACE_EXISTING)) logf("got %s", local.c_str());
+        else DeleteFileW(tmp.c_str());
+    }
+}
+
 static void updateThread() {
     for (;;) {
+        fetchExtras();
         bool manual = gUpdateCheckReq.exchange(false);
         if (checkUpdate(manual)) { gUpdateReady = true; gQuit = true; return; }
         double until = now() + 3600;

@@ -197,6 +197,9 @@ static bool targetRect(Rect &r) {
 }
 const int MW = 64, MH = 36;
 static uint32_t mini[MW * MH];
+static int16_t center[256];
+static int centerRGB[3];
+static int grayOf0(uint32_t p) { return (((p >> 16) & 255) * 3 + ((p >> 8) & 255) * 6 + (p & 255)) / 10; }
 static bool capture(uint8_t *f, float &red) {
     Rect r; if (!targetRect(r)) return false;
     const int SW = 256, SH = 144;
@@ -240,6 +243,18 @@ static bool capture(uint8_t *f, float &red) {
                 for (int i = 0; i < 4; i++) { uint32_t p = bits[(y * 4 + j) * SW + x * 4 + i]; rr += (p >> 16) & 255; gg += (p >> 8) & 255; bb += p & 255; }
             mini[y * MW + x] = ((uint32_t)(rr / 16) << 16) | ((uint32_t)(gg / 16) << 8) | (uint32_t)(bb / 16);
         }
+    {
+        int sum = 0;
+        for (int y = 0; y < 16; y++)
+            for (int x = 0; x < 16; x++) {
+                int g = 0;
+                for (int j = 0; j < 2; j++) for (int i = 0; i < 2; i++) g += grayOf0(bits[(56 + y * 2 + j) * SW + 112 + x * 2 + i]);
+                center[y * 16 + x] = (int16_t)(g / 4); sum += g / 4;
+            }
+        int mean = sum / 256;
+        for (int i = 0; i < 256; i++) center[i] = (int16_t)(center[i] - mean);
+        uint32_t c = bits[72 * SW + 128]; centerRGB[0] = (c >> 16) & 255; centerRGB[1] = (c >> 8) & 255; centerRGB[2] = c & 255;
+    }
     return true;
 }
 static int grayOf(uint32_t p) { return (((p >> 16) & 255) * 3 + ((p >> 8) & 255) * 6 + (p & 255)) / 10; }
@@ -330,6 +345,35 @@ static int whichTool() {
     }
     return (best > 0 && (second == 1e18 || bd < second * 0.85)) ? best : -1;
 }
+// things you looked at (trees, rocks, crates...) learned from what happened when you hit them, or from what you told it
+struct Look { int16_t p[256]; int rgb[3]; std::string label; int n = 1; int stat = -1; };
+static std::vector<Look> looks;
+static int lookingAt = -1;
+static int lookDist(const Look &l) {
+    int d = 0; for (int i = 0; i < 256; i++) d += std::abs(l.p[i] - center[i]);
+    for (int c = 0; c < 3; c++) d += std::abs(l.rgb[c] - centerRGB[c]) * 8;
+    return d;
+}
+static void learnLook(const std::string &label, int stat) {
+    int best = -1, bd = INT_MAX;
+    for (size_t i = 0; i < looks.size(); i++) if (looks[i].label == label) { int d = lookDist(looks[i]); if (d < bd) { bd = d; best = (int)i; } }
+    if (best >= 0 && bd < 256 * 14) { Look &l = looks[best]; l.n++; for (int i = 0; i < 256; i++) l.p[i] = (int16_t)(l.p[i] + (center[i] - l.p[i]) / std::min(l.n, 8)); return; }
+    if (looks.size() >= 300) return;
+    Look l; memcpy(l.p, center, sizeof l.p); for (int c = 0; c < 3; c++) l.rgb[c] = centerRGB[c]; l.label = label; l.stat = stat;
+    looks.push_back(l);
+}
+static int recognizeLook() {
+    int best = -1, bd = INT_MAX;
+    for (size_t i = 0; i < looks.size(); i++) { int d = lookDist(looks[i]); if (d < bd) { bd = d; best = (int)i; } }
+    return bd < 256 * 11 ? best : -1;
+}
+static int classGood[80], classBad[80];
+static double classSeen[80];
+static bool firstSeenNoted[80];
+static bool hostileClass(int c) { return classBad[c] >= 3 && classBad[c] > classGood[c] * 2; }
+static bool friendlyClass(int c) { return classGood[c] >= 3 && classGood[c] > classBad[c] * 2; }
+static double lastHitAt = 0;
+
 static std::string toolName(int i) { return i <= 0 ? "nothing known" : !tools[i].name.empty() ? tools[i].name : "slot " + std::to_string(i); }
 static int dist(const uint8_t *a, const uint8_t *b) {
     int s = 0;
@@ -413,6 +457,10 @@ static void reward(float r, int statIdx, bool up, const char *why) {
         if (f.btn & 1) { held += (held.empty() ? "" : "+") + std::string("LMB"); auto &ks = keyStats[1001]; if (r > 0) ks.good++; else if (r < 0) ks.bad++; }
         if (r < 0) { for (int c = 0; c < 3; c++) { double s = 0; for (int i = 0; i < 8; i++) s += f.f[FG + i * 3 + c]; badColor[c] += s / 8; } badColorN++; }
         for (int bin = 0; bin < 24; bin++) if (t - lastMoverSeen[bin] < 1.5) { if (r < 0) moverBad[bin]++; else if (r > 0) moverGood[bin]++; }
+        for (int c = 0; c < 80; c++) if (t - classSeen[c] < 1.5) { if (r < 0) classBad[c]++; else if (r > 0) classGood[c]++; }
+        if (r > 0 && up && statIdx >= 0 && statIdx < (int)stats.size() && t - lastHitAt < 1.2) {
+            learnLook("gives " + stats[statIdx].label, statIdx);
+        }
         if (curTool > 0 && r > 0) { tools[curTool].uses++; if (statIdx >= 0 && statIdx < MAXSTAT && up) tools[curTool].up[statIdx]++; }
         note("%s %s at Place %d%s%s", r > 0 ? "GOOD:" : r < 0 ? "BAD:" : "", why, pl + 1, held.empty() ? "" : " while pressing ", held.c_str());
     }
@@ -493,6 +541,52 @@ static void ocrThread() {
     }
 }
 
+// ---------- object detector thread ----------
+std::string seesTxt = "-";
+static void detThread() {
+    RoInitialize(RO_INIT_MULTITHREADED);
+    double lastTry = -100, lastSec = now(); int n = 0;
+    std::vector<det::Box> bs;
+    while (!gQuit) {
+        MSG msg; while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+        if (!det::ready) {
+            if (now() - lastTry > 10) { lastTry = now(); if (det::load()) logf("object detector ready (%s)", det::status.c_str()); }
+            std::lock_guard<std::mutex> lk(amu); seesTxt = "detector: " + det::status;
+            Sleep(200); continue;
+        }
+        Rect r;
+        if (!mode || mode == 3 || GetForegroundWindow() != tgt || !targetRect(r)) { det::hide(); Sleep(50); continue; }
+        if (!det::run(r, bs)) { det::hide(); Sleep(200); continue; }
+        n++;
+        if (now() - lastSec >= 1) { det::rate = n / (now() - lastSec); n = 0; lastSec = now(); }
+        std::vector<std::string> labels; std::vector<int> kind;
+        std::string txt;
+        double t = now();
+        int cxs = (r.x0 + r.x1) / 2, cys = (r.y0 + r.y1) / 2;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            for (auto &b : bs) {
+                classSeen[b.cls] = t;
+                if (!firstSeenNoted[b.cls]) { firstSeenNoted[b.cls] = true; note("first time seeing a %s", det::COCO[b.cls]); }
+                int k = hostileClass(b.cls) ? -1 : friendlyClass(b.cls) ? 1 : 0;
+                char l[64]; snprintf(l, sizeof l, " %s %d%%%s ", det::COCO[b.cls], (int)(b.conf * 100), k < 0 ? " ENEMY?" : "");
+                labels.push_back(l); kind.push_back(k);
+                if (txt.size() < 90) {
+                    int bx = (b.x0 + b.x1) / 2;
+                    bool mid = cxs > b.x0 && cxs < b.x1 && cys > b.y0 && cys < b.y1;
+                    txt += std::string(txt.empty() ? "" : ", ") + det::COCO[b.cls] + (mid ? " (ahead)" : bx < cxs ? " (left)" : " (right)") + (k < 0 ? " [enemy?]" : "");
+                }
+            }
+        }
+        if (cfgFx) det::draw(r, bs, labels, kind); else det::hide();
+        { std::lock_guard<std::mutex> lk(det::mu); det::boxes = bs; det::boxesAt = t; }
+        char hdr[96]; snprintf(hdr, sizeof hdr, "   [%s %.0f ms, %.0f/s]", det::onGpu ? "GPU" : "CPU", det::ms, det::rate);
+        std::lock_guard<std::mutex> lk(amu);
+        seesTxt = (txt.empty() ? std::string("nothing it knows") : txt) + hdr;
+    }
+    det::hide();
+}
+
 // ---------- analysis ----------
 static void analyze() {
     std::vector<std::string> out;
@@ -530,6 +624,11 @@ static void analyze() {
         for (int c = 0; c < 3; c++) { double d = badColor[c] / badColorN - allColor[c] / allColorN; if (d > bd) { bd = d; bi = c; } }
         if (bd > 8) { char b[120]; snprintf(b, sizeof b, "danger: screens get more %s right before bad stuff", nm[bi]); out.push_back(b); }
     }
+    for (int c = 0; c < 80 && out.size() < 10; c++) {
+        if (hostileClass(c)) out.push_back(std::string(det::COCO[c]) + "s show up before bad stuff - probably enemies (" + std::to_string(classBad[c]) + "x)");
+        else if (friendlyClass(c)) out.push_back(std::string(det::COCO[c]) + "s come with good stuff");
+    }
+    for (size_t i = 0; i < looks.size() && out.size() < 10; i++) if (looks[i].n >= 3 && looks[i].label.rfind("gives ", 0) == 0) out.push_back("learned what things that " + looks[i].label + " look like (" + std::to_string(looks[i].n) + " hits)");
     for (int bin = 0; bin < 24 && out.size() < 10; bin++) {
         if (hostileBin(bin)) out.push_back(colourName(bin) + " moving things show up before bad stuff - probably enemies (" + std::to_string(moverBad[bin]) + "x)");
         else if (moverGood[bin] >= 3 && moverGood[bin] > moverBad[bin] * 2) out.push_back(colourName(bin) + " moving things come with good stuff (animals to hunt? loot?)");
@@ -685,6 +784,15 @@ static void saveRules() {
         for (size_t i = 0; i < places.size(); i++) if (places[i].look.rfind("\"", 0) == 0) fprintf(f, "place %d %s\n", (int)i, places[i].look.c_str());
         for (int i = 1; i <= 9; i++) if (!tools[i].name.empty()) fprintf(f, "toolname %d %s\n", i, tools[i].name.c_str());
         for (int b = 0; b < 24; b++) if (moverGood[b] || moverBad[b]) fprintf(f, "mover %d %d %d\n", b, moverGood[b], moverBad[b]);
+        for (int c = 0; c < 80; c++) if (classGood[c] || classBad[c]) fprintf(f, "class %d %d %d\n", c, classGood[c], classBad[c]);
+        fclose(f);
+    }
+    p = "copycat\\" + name + ".looks";
+    if (FILE *f = fopen(p.c_str(), "wb")) {
+        for (auto &l : looks) {
+            fwrite(l.p, sizeof l.p, 1, f); fwrite(l.rgb, sizeof l.rgb, 1, f); fwrite(&l.n, 4, 1, f); fwrite(&l.stat, 4, 1, f);
+            uint32_t L = (uint32_t)l.label.size(); fwrite(&L, 4, 1, f); fwrite(l.label.data(), 1, L, f);
+        }
         fclose(f);
     }
     p = "copycat\\" + name + ".tools";
@@ -696,6 +804,22 @@ static void saveRules() {
 static void loadRules() {
     memset(banned, 0, sizeof banned); bannedBtn = 0;
     memset(moverGood, 0, sizeof moverGood); memset(moverBad, 0, sizeof moverBad);
+    memset(classGood, 0, sizeof classGood); memset(classBad, 0, sizeof classBad);
+    looks.clear();
+    {
+        std::string lp = "copycat\\" + name + ".looks";
+        if (FILE *lf = fopen(lp.c_str(), "rb")) {
+            for (;;) {
+                Look l; uint32_t L = 0;
+                if (fread(l.p, sizeof l.p, 1, lf) != 1 || fread(l.rgb, sizeof l.rgb, 1, lf) != 1 || fread(&l.n, 4, 1, lf) != 1 || fread(&l.stat, 4, 1, lf) != 1 ||
+                    fread(&L, 4, 1, lf) != 1 || L > 200) break;
+                l.label.resize(L); if (L && fread(&l.label[0], 1, L, lf) != L) break;
+                looks.push_back(l);
+                if (looks.size() >= 300) break;
+            }
+            fclose(lf);
+        }
+    }
     for (auto &tl : tools) tl = Tool{};
     std::string p = "copycat\\" + name + ".tools";
     if (FILE *tf = fopen(p.c_str(), "rb")) {
@@ -714,7 +838,11 @@ static void loadRules() {
         else if (sscanf(line, "banbtn %d", &v) == 1) bannedBtn = v;
         else if (sscanf(line, "place %d %259[^\n]", &v, nm) == 2 && v >= 0 && v < (int)places.size()) places[v].look = nm;
         else if (sscanf(line, "toolname %d %259[^\n]", &v, nm) == 2 && v >= 1 && v <= 9) tools[v].name = nm;
-        else { int g2, b2; if (sscanf(line, "mover %d %d %d", &v, &g2, &b2) == 3 && v >= 0 && v < 24) { moverGood[v] = g2; moverBad[v] = b2; } }
+        else {
+            int g2, b2;
+            if (sscanf(line, "mover %d %d %d", &v, &g2, &b2) == 3 && v >= 0 && v < 24) { moverGood[v] = g2; moverBad[v] = b2; }
+            else if (sscanf(line, "class %d %d %d", &v, &g2, &b2) == 3 && v >= 0 && v < 80) { classGood[v] = g2; classBad[v] = b2; }
+        }
     }
     fclose(f);
 }
@@ -765,6 +893,34 @@ static bool explain(const std::string &raw, int place) {
                     note("%s moving things are %s", c[0], enemy ? "ENEMIES" : "friendly");
                     did = true; good = bad = false;
                 }
+    }
+    {
+        static const char *cw[][2] = {{"person", "0"}, {"people", "0"}, {"player", "0"}, {"guy", "0"}, {"npc", "0"}, {"scientist", "0"}, {"human", "0"},
+                                      {"bandit", "0"}, {"soldier", "0"}, {"zombie", "0"}, {"bear", "21"}, {"wolf", "16"}, {"wolves", "16"}, {"dog", "16"},
+                                      {"deer", "17"}, {"horse", "17"}, {"cow", "19"}, {"boar", "18"}, {"pig", "18"}, {"sheep", "18"}, {"bird", "14"},
+                                      {"chicken", "14"}, {"car", "2"}, {"truck", "7"}, {"boat", "8"}, {"heli", "4"}, {"plane", "4"}, {"bike", "3"}};
+        bool enemy = t.find("enem") != std::string::npos || t.find("hostile") != std::string::npos || t.find("danger") != std::string::npos ||
+                     t.find("kill") != std::string::npos || t.find("attack") != std::string::npos || t.find("shoot") != std::string::npos;
+        bool friendly = t.find("friend") != std::string::npos || t.find("ally") != std::string::npos || t.find("safe") != std::string::npos ||
+                        t.find("food") != std::string::npos || t.find("hunt") != std::string::npos || t.find("ride") != std::string::npos;
+        if (enemy != friendly)
+            for (auto &c : cw)
+                if ((" " + t).find(std::string(" ") + c[0]) != std::string::npos) {
+                    int k = atoi(c[1]);
+                    if (enemy) classBad[k] += 10; else classGood[k] += 10;
+                    note("%ss are %s", det::COCO[k], enemy ? "ENEMIES" : "good / friendly");
+                    did = true; break;
+                }
+    }
+    for (const char *ph : {"that s a ", "that s an ", "thats a ", "thats an ", "that is a ", "that is an ", "looking at a ", "looking at an ", "looking at "}) {
+        size_t k = t.find(ph);
+        if (k == std::string::npos) continue;
+        std::string nm = t.substr(k + strlen(ph));
+        while (!nm.empty() && nm.back() == ' ') nm.pop_back();
+        if (nm.empty()) break;
+        { std::lock_guard<std::mutex> lk(mu); learnLook(nm, -1); }
+        note("remembered what a %s looks like (the thing in the middle of the screen)", nm.c_str());
+        did = true; break;
     }
     size_t at = std::string::npos;
     for (const char *ph : {"this place is ", "this is ", "here is ", "call this ", "this area is "}) if ((at = t.find(ph)) != std::string::npos) { at += strlen(ph); break; }
@@ -831,6 +987,16 @@ static long decide(const uint8_t *f) {
         bool enemyNear = false;
         for (auto &mv : movers)
             if (hostileBin(colourBin(mv.r, mv.g, mv.b)) && std::abs(mv.x - MW / 2) < MW / 4 && std::abs(mv.y - MH / 2) < MH / 3) enemyNear = true;
+        {
+            std::lock_guard<std::mutex> dl(det::mu);
+            Rect r;
+            if (now() - det::boxesAt < 0.5 && targetRect(r)) {
+                int cx = (r.x0 + r.x1) / 2, cy = (r.y0 + r.y1) / 2, mx = (r.x1 - r.x0) / 4, my = (r.y1 - r.y0) / 4;
+                for (auto &b : det::boxes)
+                    if (hostileClass(b.cls) && b.x1 > cx - mx && b.x0 < cx + mx && b.y1 > cy - my && b.y0 < cy + my) enemyNear = true;
+            }
+        }
+        bool resourceAhead = lookingAt >= 0 && looks[lookingAt].stat >= 0 && needMask && (needMask & (1u << looks[lookingAt].stat));
         wantTool = -1;
         if (!needIdx.empty()) {
             int bn = 0;
@@ -843,6 +1009,7 @@ static long decide(const uint8_t *f) {
             if (needMask && (fr.up & needMask)) w *= 3;
             if (needMask && (fr.down & needMask)) w *= 0.4;
             if (enemyNear && (fr.btn & 1)) w *= 2.5;
+            if (resourceAhead && (fr.btn & 1)) w *= 3;
             W += w; val += w * fr.value;
             if (w > best) { best = w; pick = (long)h.i; }
         }
@@ -857,6 +1024,7 @@ static long decide(const uint8_t *f) {
             g = b;
             if (wantTool > 0) g += " with " + toolName(wantTool);
         } else if (enemyNear) g = "enemy-looking thing ahead - fighting like you did";
+        if (resourceAhead) g = "looking at something that " + looks[lookingAt].label + " - hitting it";
         else if (W > 0 && val / W > 0.3) g = "heading for something good (similar moments paid off)";
         else if (W > 0 && val / W < -0.3) g = "careful - similar moments went badly";
         else g = "replaying what you did in a moment like this";
@@ -909,6 +1077,8 @@ static void loop() {
             if (havePrev) findMovers(prevMini, mini, sx, sy);
             memcpy(prevMini, mini, sizeof prevMini);
             if (frames % 5 == 0) curTool = whichTool();
+            if (frames % 3 == 0) lookingAt = recognizeLook();
+            if (btnState & 1 || btnOut & 1) lastHitAt = now();
         }
         memcpy(prev, f, FD); havePrev = true;
 
@@ -1059,7 +1229,8 @@ static void loop() {
                 aimAllSum += sp; aimAllN++;
             }
             std::lock_guard<std::mutex> l2(amu);
-            placeTxt = "Place " + std::to_string(fr.place + 1) + " (" + places[fr.place].look + ")   holding: " + toolName(curTool);
+            placeTxt = "Place " + std::to_string(fr.place + 1) + " (" + places[fr.place].look + ")   holding: " + toolName(curTool) +
+                       (lookingAt >= 0 ? "   looking at: " + looks[lookingAt].label : "");
             std::string mv;
             for (size_t i = 0; i < movers.size() && i < 3; i++) {
                 const Mover &q = movers[i];
@@ -1087,6 +1258,7 @@ void stop() {
     releaseAll();
     analyze();
     fileSave();
+    { std::lock_guard<std::mutex> lk(mu); saveRules(); }
     std::vector<std::string> fs;
     { std::lock_guard<std::mutex> lk(amu); fs = findings; }
     note("stopped %s - %d frames of you, %d of me, %d places, %d things noted", was == 1 ? "watching" : "copying", demoN, selfN, (int)places.size(), (int)fs.size());
@@ -1163,8 +1335,8 @@ void renderHud() {
         DrawTextW(dc, w.c_str(), -1, &r, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     };
     COLORREF white = RGB(240, 244, 255), dim = RGB(150, 160, 185), lab = RGB(110, 150, 220), hot = RGB(ar, ag, ab);
-    std::string g, ct, at, wt, pt, mt; std::deque<std::string> ns; std::vector<std::string> fs;
-    { std::lock_guard<std::mutex> lk(amu); g = goal; ct = confusedTxt; at = actionTxt; wt = watchTxt; pt = placeTxt; mt = moverTxt; ns = notes; fs = findings; }
+    std::string g, ct, at, wt, pt, mt, se; std::deque<std::string> ns; std::vector<std::string> fs;
+    { std::lock_guard<std::mutex> lk(amu); g = goal; ct = confusedTxt; at = actionTxt; wt = watchTxt; pt = placeTxt; mt = moverTxt; se = seesTxt; ns = notes; fs = findings; }
     std::string modeTxt = m == 1 ? "WATCHING YOU" : m == 3 ? "ASKING YOU" : takeover ? "YOU'RE DRIVING - RECORDING" : "PLAYING ON ITS OWN";
     text(fT, white, 18, 12, "COOKIEBOT COPYCAT");
     text(fB, hot, 220, 16, modeTxt);
@@ -1178,10 +1350,12 @@ void renderHud() {
     text(fS, white, 130, 87, wt);
     text(fL, lab, 18, 108, "WHERE");
     text(fS, white, 130, 107, pt);
-    text(fL, lab, 18, 128, "MOVING");
-    text(fS, white, 130, 127, mt);
-    text(fL, lab, 18, 148, "ANALYZING");
-    int y = 147;
+    text(fL, lab, 18, 128, "SEES");
+    text(fS, white, 130, 127, se);
+    text(fL, lab, 18, 148, "MOVING");
+    text(fS, white, 130, 147, mt);
+    text(fL, lab, 18, 168, "ANALYZING");
+    int y = 167;
     if (fs.empty()) { text(fS, dim, 130, y, "not enough data yet"); y += 16; }
     for (auto &s : fs) { text(fS, white, 130, y, s); y += 16; if (y > 232) break; }
     text(fL, lab, 18, 250, "TRYING TO GET");
@@ -1224,6 +1398,7 @@ bool hudWanted() { return mode && tgt && GetForegroundWindow() == tgt; }
 void init() {
     std::thread(rawThread).detach();
     std::thread(ocrThread).detach();
+    std::thread(detThread).detach();
 }
 
 }  // namespace cc

@@ -591,6 +591,9 @@ CONTENTS
       "red ones are enemies" / "green ones are friendly"
                                         -> colour of moving things
       "3 is the hatchet"                -> names hotbar slot 3
+      "bears are dangerous" / "people are enemies" / "cows are food"
+                                        -> what detected things are
+      "that's a tree" / "looking at a rock" -> names what's in the middle
       or an action ("run forward", "shoot", "turn around").
       Rules/names are saved in copycat\<game>.rules.
 
@@ -619,6 +622,28 @@ CONTENTS
 
   Needs: if health/food/water/etc. gets low or keeps dropping, it
   favours moments that raised that stat before ("trying to get").
+
+  Object detector (real trained AI): YOLOX-S, a neural network
+  trained on 80 everyday things - people, cars, trucks, boats,
+  planes, bikes, dogs, horses, cows, bears, birds, backpacks,
+  bottles, knives, chairs... It runs on your GPU through ONNX Runtime
+  + DirectML (CPU if the GPU won't work), several times a second, and
+  draws labelled boxes over the game (red = enemy, green = friendly,
+  yellow = unknown). Whatever it sees right before bad/good events
+  gets marked enemy/friendly ("persons show up before bad stuff ->
+  probably enemies"); with an enemy ahead it favours moments where
+  you were shooting. The first run downloads ~75 MB of extra files
+  next to the exe (onnxruntime.dll, DirectML.dll, yolox_s.onnx); the
+  SEES row on the HUD shows its status. It only knows those 80
+  everyday classes - game-specific things (ore nodes, hatchets)
+  come from the next two features.
+
+  "What am I looking at": it keeps a small picture of the middle of
+  the screen. When you hit something and a stat goes up right after
+  (wood, stone...), it remembers what that thing looked like as
+  "gives wood". F10 "that's a tree" / "looking at a crate" teaches it
+  by name. When it needs wood and is looking at a "gives wood" thing,
+  it hits it.
 
   Moving things: each frame it removes the camera's own motion and
   finds what is still moving (players, NPCs, animals, vehicles),

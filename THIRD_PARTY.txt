@@ -1,0 +1,7 @@
+CookieBot's object detector uses:
+
+- ONNX Runtime 1.24.4 (onnxruntime.dll, onnxruntime_providers_shared.dll) - MIT License, Microsoft. https://github.com/microsoft/onnxruntime
+- DirectML (DirectML.dll) - redistributable under the Microsoft DirectML license, shipped in the onnxruntime-directml package.
+- YOLOX-S (yolox_s.onnx) - Apache License 2.0, Megvii. https://github.com/Megvii-BaseDetection/YOLOX
+
+The .dl_ files are the DLLs renamed; CookieBot downloads them next to itself and names them .dll.
