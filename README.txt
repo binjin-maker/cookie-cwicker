@@ -699,6 +699,37 @@ CONTENTS
   animals/items it considers good. It never turns onto people or
   enemies by itself - aiming at those only comes from copying you.
 
+  Camera commands (F10, while it's playing):
+      "look at 800 400"  -> turns so that screen spot is under the crosshair
+                            (screen pixels; the WHERE row shows positions)
+      "turn left 90" / "turn right 30" / "turn around" / "look up 20"
+                         (degrees, assuming a ~90 degree view)
+      "look at the bear" -> anything it detects, except people/enemies
+  It's only as accurate as its camera calibration - let it watch you
+  move the mouse for a minute first (CAMERA row shows when it's learned).
+
+  Explaining how to do something (no recording needed), F10:
+      "teach hunt when you see a cow: look at it then walk until close
+       then hit 3 times"
+      "if detect bottle then aim at bottle offset -40 20 then click"
+      "when you see a dog, look at it then walk to it then press e"
+      "teach loot: press e then wait 1 then press tab"
+    Steps (separated by "then" or commas):
+      look/aim at <thing> [offset X Y]  turn until it's under the
+                                        crosshair; offset in pixels from
+                                        its centre (X right, Y down)
+      turn left/right/up/down N, turn around
+      walk/run forward/back/left/right [N seconds]
+      walk until close / walk to it     keeps steering at the thing
+      hit/attack/click [N seconds | N times], aim/crouch [N seconds]
+      press <key> [N times], use/loot/eat (E), jump, reload, wait N
+      do <other task>
+    "it"/"them" means the thing from the "when". Things = anything the
+    detector knows, or what you renamed it to ("vases are barrels").
+    It won't aim at people or enemies - steps that would are skipped.
+    A recorded task whose "when" is "you see a <thing>" now turns to
+    face that thing first, then does what you showed.
+
   Moving things: each frame it removes the camera's own motion and
   finds what is still moving (players, NPCs, animals, vehicles),
   with colour and shape (tall = person-like, wide = animal/vehicle-
