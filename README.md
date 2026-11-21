@@ -153,6 +153,18 @@ when low on health run away from person
 teach loot: press e then wait 1 then press tab        (run it with: do loot)
 ```
 
+**Named tasks in one line:** `set task <name> if <condition> then <steps>`, for example:
+
+```
+set task flee if health < 30 then aim away from enemy and hold w and shift
+```
+
+* `<` / `>` work like below / above.
+* `aim away from <thing / enemy>` turns so the thing ends up behind you. It keeps turning while the next steps run, so you sprint off as it turns.
+* `hold <keys>` with no time keeps holding while the task's condition is still true (up to 15 s).
+* `and <action>` starts a new step. `w and shift` stays one hold.
+* `aim at enemy` / `look at enemy` aim at whatever it counts as hostile.
+
 **Chaining with `=>`:** each `=>` part runs after the part before it finishes, but only if its own `if` is true right then (it waits up to 1 s). If it isn't, the rest of the chain is skipped.
 
 ```

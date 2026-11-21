@@ -1211,7 +1211,8 @@ static void updateSeen() {
     seenRaw.clear(); seenRawShot = det::shotAt;
     for (auto &b : det::rawBoxes) {
         Seen s2{}; s2.cls = b.cls; s2.conf = b.conf; s2.cx = (b.x0 + b.x1) / 2; s2.cy = (b.y0 + b.y1) / 2; s2.w = b.x1 - b.x0; s2.h = b.y1 - b.y0;
-        s2.own = b.own; seenRaw.push_back(s2);
+        s2.own = b.own; s2.hostile = !b.own && (hostileClass(b.cls) || (!anyHostile && b.cls == 0)); s2.friendly = !b.own && friendlyClass(b.cls);
+        seenRaw.push_back(s2);
     }
 }
 // spare bytes at the end of each frame: [0]=enemy present, [1]=x, [2]=y (0-255 across the view), [3]=size
@@ -1231,6 +1232,7 @@ static void stampEnemy(uint8_t *f) {
 static double camX = 0, camY = 0;      // mouse counts still to turn
 static std::string camWhy = "-";
 static bool camForced = false;  // you told it where to look
+static bool camBg = false;  // a turn that keeps going while the next steps run
 static int forceAimCls = -1; static double forceAimUntil = 0;  // F10 "look at the <thing>"
 static double camDoneAt = 0;   // when the last queued turn finished
 static double aimK = 0;        // px per mouse count, measured from its own aiming moves
@@ -1248,6 +1250,8 @@ static void camStep(int &mx, int &my) {
     if (std::fabs(camX) < 1 && std::fabs(camY) < 1) { camX = camY = 0; camDoneAt = now(); }
 }
 
+// cls -2 = "enemy": anything it counts as hostile
+static std::string tgtName(int cls) { return cls == -2 ? std::string("enemy") : cls >= 0 && cls < 80 ? className(cls) : std::string("thing"); }
 // closed-loop aim: move, wait for a detector frame shot after the move stopped, measure again.
 // learns px-per-count from its own moves so it doesn't overshoot and swing back and forth.
 static struct AimState { int cls = -1; double lastShot = 0, errX = 0, errY = 0, movX = 0, movY = 0, tx = 0, ty = 0, lostSince = 0, lastSeen = 0, lastSearch = 0; bool moved = false, have = false; } aimS;
@@ -1267,7 +1271,7 @@ static int aimStep(int cls, double offX, double offY) {
     double expX = aimS.tx - (aimS.moved ? aimS.movX * k : 0), expY = aimS.ty - (aimS.moved ? aimS.movY * k : 0);
     const Seen *best = nullptr; double bd = 1e18;
     for (auto &s2 : seenRaw) {
-        if (s2.own || (cls >= 0 && s2.cls != cls)) continue;
+        if (s2.own || (cls >= 0 && s2.cls != cls) || (cls == -2 && !s2.hostile)) continue;
         double d = aimS.have ? std::hypot(s2.cx - expX, s2.cy - expY) : std::hypot(s2.cx - cx, s2.cy - cy);
         if (d < bd) { bd = d; best = &s2; }
     }
@@ -1298,7 +1302,7 @@ static void aimSearch(int cls) {
     Rect r; if (!targetRect(r)) return;
     if (std::fabs(camX) >= 1 || now() - camDoneAt < 0.6 || now() - aimS.lastSearch < 0.8) return;
     double dir = aimS.have ? (aimS.errX < 0 ? -1 : 1) : 1;
-    camTurnPixels((r.x1 - r.x0) * 0.25 * dir, 0, "searching for a " + className(cls));
+    camTurnPixels((r.x1 - r.x0) * 0.25 * dir, 0, "searching for a " + tgtName(cls));
     aimS.lastSearch = now();
 }
 
@@ -1307,7 +1311,7 @@ struct Step { uint8_t keys[32]; uint8_t btn; int16_t dx, dy; };
 // a step of an explained approach: "look at the cow then walk until close then hit 3 times"
 struct Cmd { int type = 0; int vk = 0, btn = 0, cls = -1, times = 0; double secs = 1, px = 0, py = 0; bool sprint = false; std::string task; std::vector<int> extra;
              int ckind = 0; std::string cwhat, cwhen; double cnum = -1; };  // C_IF: condition checked when the chain gets there
-enum { C_LOOK = 1, C_TURN, C_MOVE, C_UNTIL, C_CLICK, C_TAP, C_WAIT, C_HOLD, C_RUN, C_IF };
+enum { C_LOOK = 1, C_TURN, C_MOVE, C_UNTIL, C_CLICK, C_TAP, C_WAIT, C_HOLD, C_RUN, C_IF, C_AWAY };
 struct Task {
     std::string name, when, script;
     std::vector<Cmd> cmds;
@@ -1357,6 +1361,12 @@ static std::vector<Cmd> parseSteps(const std::string &raw, int defCls) {
     std::vector<Cmd> out;
     std::string t = " " + lower(raw) + " ";
     for (auto &c : t) if (!isalnum((unsigned char)c) && c != ' ' && c != ',' && c != '-') c = ' ';
+    // "aim away from enemy and hold w and shift": " and " starts a new step only before an action word
+    for (const char *v : {"aim", "look", "turn", "face", "hold", "press", "tap", "walk", "run", "sprint", "move", "go", "click", "hit", "attack", "shoot", "jump", "crouch",
+                          "reload", "use", "eat", "drink", "loot", "wait", "do", "flee", "retreat", "strafe"}) {
+        std::string a = std::string(" and ") + v + " "; size_t q;
+        while ((q = t.find(a)) != std::string::npos) t.replace(q, 5, " | ");
+    }
     for (const char *sep : {", and then ", " and then ", ", then ", " then ", ", "}) {
         size_t p; while ((p = t.find(sep)) != std::string::npos) t.replace(p, strlen(sep), " | ");
     }
@@ -1389,7 +1399,7 @@ static std::vector<Cmd> parseSteps(const std::string &raw, int defCls) {
             // everything named between "hold" and "for" is held together: "hold rmb && lmb for 300ms", "hold w and shift for 2s"
             std::string body = p.substr(p.find(" hold ") + 6);
             size_t fo = body.find(" for "); if (fo != std::string::npos) body = body.substr(0, fo);
-            Cmd h; h.type = C_HOLD; h.secs = n > 0 ? n : 1;
+            Cmd h; h.type = C_HOLD; h.secs = n > 0 ? n : 1; if (n <= 0) h.times = -1;  // no time given: hold while the condition lasts
             auto toks = split(body);
             for (size_t i = 0; i < toks.size(); i++) {
                 const std::string &w = toks[i];
@@ -1408,7 +1418,9 @@ static std::vector<Cmd> parseSteps(const std::string &raw, int defCls) {
             if (h.btn || !h.extra.empty()) { out.push_back(h); continue; }
         }
         if (cls < 0 && (has(" it ") || has(" them ") || has(" that ") || has(" one "))) cls = defCls;
-        if ((has(" look at") || has(" face ") || has(" aim at") || has(" point at")) && cls >= 0) {
+        if (cls < 0 && (has(" enem") || has(" hostile") || has(" bad guy"))) cls = -2;
+        if (has(" away from") && (has(" aim") || has(" look") || has(" turn") || has(" face") || has(" point"))) { c.type = C_AWAY; c.cls = cls; }
+        else if ((has(" look at") || has(" face ") || has(" aim at") || has(" point at")) && (cls >= 0 || cls == -2)) {
             c.type = C_LOOK; c.cls = cls; c.secs = 3;
             size_t o = p.find(" offset ");
             if (o != std::string::npos) {
@@ -1477,10 +1489,10 @@ static void parseWhen(Task &k) {
                 if (t.find(" " + n, p) != std::string::npos || t.find(" " + n2, p) != std::string::npos) { k.kind = 3; k.num = c; k.what = n; return; }
             }
         }
-    bool low = t.find(" low") != std::string::npos || t.find(" below") != std::string::npos || t.find(" under") != std::string::npos ||
+    bool low = t.find('<') != std::string::npos || t.find(" low") != std::string::npos || t.find(" below") != std::string::npos || t.find(" under") != std::string::npos ||
                t.find(" drops") != std::string::npos || t.find(" less than") != std::string::npos || t.find(" empty") != std::string::npos ||
                t.find(" hungry") != std::string::npos || t.find(" thirsty") != std::string::npos || t.find(" hurt") != std::string::npos;
-    bool high = t.find(" high") != std::string::npos || t.find(" above") != std::string::npos || t.find(" over ") != std::string::npos ||
+    bool high = (t.find('>') != std::string::npos && !low) || t.find(" high") != std::string::npos || t.find(" above") != std::string::npos || t.find(" over ") != std::string::npos ||
                 t.find(" full") != std::string::npos || t.find(" more than") != std::string::npos;
     if (low || high) {
         k.kind = low ? 1 : 2; k.num = num(0);
@@ -1666,7 +1678,15 @@ static bool taskCommand(const std::string &raw) {
             size_t colon = rl.find(':');
             size_t by = rest.find(" by ");
             std::string scriptTxt;
+            size_t arrow = rl.find("=>"), thn = rl.find(" then ");
             if (colon != std::string::npos) scriptTxt = rl.substr(colon + 1);
+            else if (thn != std::string::npos && thn < arrow) {
+                // "set task flee if health < 30 then aim away from enemy and hold w and shift"
+                scriptTxt = rl.substr(thn + 6);
+                std::string head = " " + rl.substr(0, thn) + " ";
+                for (const char *ph : {" teach ", " learn ", " this is how to ", " this is how you ", " task "}) { size_t q = head.find(ph); if (q != std::string::npos) { rest = head.substr(q + strlen(ph)); break; } }
+                rest = " " + rest + " ";
+            }
             else if (by != std::string::npos) { scriptTxt = rest.substr(by + 4); rest = rest.substr(0, by); }
             if (!scriptTxt.empty()) {
                 std::string head = colon != std::string::npos ? rl.substr(0, colon) : "";
@@ -2042,7 +2062,7 @@ static void loop() {
                         else if (a < 0) aimSearch(c.cls);
                         camStep(mx, my);
                         if (el > c.secs + 3) done = true;
-                        what = "look at " + className(c.cls);
+                        what = "look at " + tgtName(c.cls);
                         break;
                     }
                     case C_TURN: camStep(mx, my); done = std::fabs(camX) < 1 && std::fabs(camY) < 1; what = "turn"; break;
@@ -2068,13 +2088,28 @@ static void loop() {
                         b = c.btn;
                         if (c.extra.empty() && c.vk) ko[c.vk >> 3] |= 1 << (c.vk & 7);
                         for (int vk : c.extra) ko[vk >> 3] |= 1 << (vk & 7);
-                        done = el > std::max(0.17, c.secs); what = "hold"; break;
+                        if (c.times == -1 && k.kind >= 1 && k.kind <= 5) { std::string why; done = el > 0.5 && (!condNow(k, why) || el > 15); }
+                        else done = el > std::max(0.17, c.secs);
+                        what = "hold"; break;
                     case C_TAP: { double ph = std::fmod(el, 0.3); if (ph < 0.12) ko[c.vk >> 3] |= 1 << (c.vk & 7); if (el > c.times * 0.3) done = true; what = "press " + keyName(c.vk); break; }
                     case C_WAIT: done = el > c.secs; what = "wait"; break;
                     case C_RUN: {
                         for (size_t i = 0; i < tasks.size(); i++)
                             if ((int)i != runningTask && !tasks[i].name.empty() && c.task.find(tasks[i].name) != std::string::npos) { runningTask = (int)i; runStep = 0; taskWhy = "part of " + k.name; break; }
                         done = true; what = "do " + c.task; break;
+                    }
+                    case C_AWAY: {
+                        // put the thing straight behind you (180 deg ~ two screen widths at ~90 deg view), keep turning during the next steps
+                        Rect r; double px = 0;
+                        if (targetRect(r)) {
+                            double W = r.x1 - r.x0, cx = (r.x0 + r.x1) / 2.0; const Seen *best = nullptr;
+                            { std::lock_guard<std::mutex> lk(mu);
+                              for (auto &s2 : seenNow) if (!s2.own && (c.cls == -1 || (c.cls == -2 ? s2.hostile : s2.cls == c.cls)) && (!best || s2.w * s2.h > best->w * best->h)) best = &s2;
+                              px = best ? best->cx - cx : 0; }
+                            px += px >= 0 ? -2 * W : 2 * W;   // turn the short way round
+                            camTurnPixels(px, 0, "turning away from the " + tgtName(c.cls)); camBg = true;
+                        }
+                        done = true; what = "aim away from " + tgtName(c.cls); break;
                     }
                     case C_IF: {
                         Task q; q.kind = c.ckind; q.what = c.cwhat; q.num = c.cnum; std::string why;
@@ -2085,6 +2120,8 @@ static void loop() {
                     }
                     default: done = true;
                     }
+                    if (camBg && c.type != C_LOOK && c.type != C_TURN && c.type != C_UNTIL) { int bx = 0, by = 0; camStep(bx, by); mx += bx; my += by; }
+                    if (std::fabs(camX) < 1 && std::fabs(camY) < 1) camBg = false;
                     if (done) { cmdIdx++; cmdInit = false; }
                     std::lock_guard<std::mutex> lk(amu);
                     goal = "task \"" + k.name + "\" (" + taskWhy + ")";
