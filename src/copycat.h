@@ -983,7 +983,11 @@ static void loadRules() {
             if (sscanf(line, "mover %d %d %d", &v, &g2, &b2) == 3 && v >= 0 && v < 24) { moverGood[v] = g2; moverBad[v] = b2; }
             else if (sscanf(line, "class %d %d %d", &v, &g2, &b2) == 3 && v >= 0 && v < 80) { classGood[v] = g2; classBad[v] = b2; }
             else if (sscanf(line, "userclass %d %d", &v, &g2) == 2 && v >= 0 && v < 80) userClass[v] = g2;
-            else if (sscanf(line, "alias %d %259[^\n]", &v, nm) == 2 && v >= 0 && v < 80) classAlias[v] = nm;
+            else if (sscanf(line, "alias %d %259[^\n]", &v, nm) == 2 && v >= 0 && v < 80) {
+                std::string a = nm; int words = (int)split(a).size(); bool bad = words > 3;
+                for (const char *w : {" run", " away", " when", " if ", " low", " health", " then", " shoot", " kill"}) if ((" " + a + " ").find(w) != std::string::npos) bad = true;
+                if (!bad) classAlias[v] = a; else logf("Copycat: dropped a broken name for %s (\"%s\")", det::COCO[v], nm);
+            }
             else { float wv, wy; if (sscanf(line, "statweight %f %259[^\n]", &wv, nm) == 2) statOverride[nm] = wv; else if (sscanf(line, "camera %f %f", &wv, &wy) == 2) { ppcX = wv; ppcY = wy; } }
         }
     }
@@ -1084,6 +1088,10 @@ static bool explain(const std::string &raw, int place) {
         for (auto &h : hit) note("%s: %s", h.c_str(), nothing ? "doesn't matter - ignoring it" : isBad ? "going up is BAD" : "going up is good");
         if (!hit.empty()) did = true;
     }
+    if (t.find("reset names") != std::string::npos || t.find("forget names") != std::string::npos || t.find("reset labels") != std::string::npos) {
+        for (auto &a : classAlias) a.clear();
+        note("all renamed things are back to their normal names"); saveRules(); return true;
+    }
     // "that's my gun" / "airplane is my gun" / "airplanes are guns"
     {
         bool mineWord = t.find("my gun") != std::string::npos || t.find("my weapon") != std::string::npos || t.find("my rifle") != std::string::npos ||
@@ -1097,14 +1105,28 @@ static bool explain(const std::string &raw, int place) {
         }
         std::string aliasTo;
         for (const char *ph : {" are ", " is a ", " is an ", " is my ", " is "}) {
-            size_t k = t.find(ph);
-            if (named >= 0 && k != std::string::npos) {
-                aliasTo = t.substr(k + strlen(ph));
+            size_t k = (" " + t).find(ph);
+            if (named < 0 || k == std::string::npos) continue;
+            // the class word has to end right where "is/are" starts ("bottles are barrels", "airplane is my gun")
+            std::string before = (" " + t).substr(0, k);
+            std::string n1 = det::COCO[named], n2 = className(named);
+            auto endsWith = [&](const std::string &w) { return before.size() >= w.size() && before.compare(before.size() - w.size(), w.size(), w) == 0; };
+            if (!(endsWith(n1) || endsWith(n1 + "s") || endsWith(n2) || endsWith(n2 + "s"))) continue;
+            {
+                aliasTo = (" " + t).substr(k + strlen(ph));
                 for (const char *dropw : {"my ", "a ", "an ", "the "}) if (aliasTo.rfind(dropw, 0) == 0) aliasTo = aliasTo.substr(strlen(dropw));
                 while (!aliasTo.empty() && aliasTo.back() == ' ') aliasTo.pop_back();
                 if (!aliasTo.empty() && aliasTo.back() == 's' && aliasTo.size() > 3) aliasTo.pop_back();
                 break;
             }
+        }
+        {
+            int words = (int)split(aliasTo).size();
+            static const char *verbs[] = {"run", "walk", "go", "when", "if", "then", "low", "high", "health", "away", "shoot", "kill", "attack", "look", "aim",
+                                          "hit", "press", "hold", "click", "jump", "use", "turn", "do", "don", "dont", "never", "always", "should", "can", "will"};
+            bool instr = words > 3;
+            for (auto &w : split(aliasTo)) for (auto v : verbs) if (w == v) instr = true;
+            if (instr) aliasTo.clear();
         }
         bool gunish = aliasTo.find("gun") != std::string::npos || aliasTo.find("weapon") != std::string::npos || aliasTo.find("rifle") != std::string::npos ||
                       aliasTo.find("pistol") != std::string::npos || aliasTo.find("arm") != std::string::npos || aliasTo.find("hand") != std::string::npos ||
@@ -1306,6 +1328,10 @@ static std::vector<Cmd> parseScript(const std::string &raw, int defCls = -1) {
             if (has(" up")) c.py = -d; else if (has(" down")) c.py = d;
         }
         else if (has(" until ") && (has(" close") || has(" near") || has(" there") || has(" reach"))) { c.type = C_UNTIL; c.cls = cls; c.secs = 8; c.sprint = has(" run") || has(" sprint"); c.vk = 'W'; }
+        else if (has(" away") || has(" flee") || has(" escape") || has(" retreat")) {
+            Cmd tr; tr.type = C_TURN; tr.px = 180; out.push_back(tr);
+            c.type = C_MOVE; c.vk = 'W'; c.sprint = true; c.secs = n > 0 ? n : 4;
+        }
         else if (has(" walk") || has(" go ") || has(" move") || has(" run") || has(" sprint") || has(" forward") || has(" back") || has(" strafe")) {
             c.type = C_MOVE; c.vk = has(" back") ? 'S' : has(" left") ? 'A' : has(" right") ? 'D' : 'W';
             c.sprint = has(" run") || has(" sprint"); c.secs = n > 0 ? n : 1.5;
@@ -1360,7 +1386,7 @@ static void parseWhen(Task &k) {
                 t.find(" full") != std::string::npos || t.find(" more than") != std::string::npos;
     if (low || high) {
         k.kind = low ? 1 : 2; k.num = num(0);
-        static const char *skipw[] = {"when", "my", "is", "the", "gets", "get", "low", "below", "under", "drops", "high", "above", "over", "full", "less", "more",
+        static const char *skipw[] = {"when", "if", "on", "of", "in", "my", "is", "the", "gets", "get", "low", "below", "under", "drops", "high", "above", "over", "full", "less", "more",
                                       "than", "empty", "it", "i", "m", "am", "you", "are", "bar", "meter"};
         auto toks = split(t);
         for (auto &w : toks) {
@@ -1561,6 +1587,15 @@ static bool taskCommand(const std::string &raw) {
         size_t cut = rl.find(':'), skip = 1;
         if (cut == std::string::npos) { cut = rl.find(" then "); skip = 6; }
         if (cut == std::string::npos) { cut = rl.find(','); skip = 1; }
+        if (cut == std::string::npos) {
+            // no separator: the action starts at the first action word
+            static const char *acts[] = {" run ", " flee ", " escape ", " retreat ", " walk ", " go ", " move ", " look ", " aim ", " turn ", " hit ", " attack ",
+                                         " click ", " press ", " hold ", " jump ", " crouch ", " use ", " eat ", " drink ", " heal ", " reload ", " do ", " wait "};
+            std::string rl2 = " " + rl + " ";
+            size_t best = std::string::npos;
+            for (auto a : acts) { size_t q = rl2.find(a, 4); if (q != std::string::npos && q < best) best = q; }
+            if (best != std::string::npos && best > 1) { cut = best - 1; skip = 0; }
+        }
         if (cut != std::string::npos) {
             Task k; k.when = rl.substr(0, cut); k.script = rl.substr(cut + skip);
             parseWhen(k);
