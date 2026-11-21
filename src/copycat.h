@@ -1283,10 +1283,18 @@ static void loadTasks() {
     fclose(f);
 }
 // "teach heal when health is low", "learn: reload when ammo is empty", "this is how to loot when looking at a crate", "done", "do heal"
+static bool askAllowed = false;  // off unless you turn it on: F10 "ask me"
 static bool taskCommand(const std::string &raw) {
     std::string t = lower(raw);
     for (auto &c : t) if (!isalnum((unsigned char)c) && c != ' ') c = ' ';
     std::string tt = " " + t + " ";
+    if (tt.find(" don t ask") != std::string::npos || tt.find(" dont ask") != std::string::npos || tt.find(" stop asking") != std::string::npos ||
+        tt.find(" no questions") != std::string::npos || tt.find(" quiet") != std::string::npos) {
+        askAllowed = false; note("ok - won't ask what you're doing anymore (F10 \"ask me\" to turn it back on)"); return true;
+    }
+    if (tt.find(" ask me") != std::string::npos || tt.find(" you can ask") != std::string::npos) {
+        askAllowed = true; note("ok - will ask when it's really lost (at most every 3 minutes)"); return true;
+    }
     if (teaching >= 0 && (tt.find(" done ") != std::string::npos || tt.find(" finished ") != std::string::npos || tt.find(" end ") != std::string::npos ||
                           tt.find(" stop ") != std::string::npos || tt.find(" that s it ") != std::string::npos || tt.find(" thats it ") != std::string::npos)) {
         Task &k = tasks[teaching];
@@ -1663,7 +1671,7 @@ static void loop() {
                             plan = parseAnswer(mems[bm].text);
                             note("this looks like when you said \"%s\" - doing that", mems[bm].text.c_str());
                             confusedSince = 0;
-                        } else if (now() - lastAsk > 60) { openAsk(); continue; }
+                        } else if (askAllowed && act.empty() && now() - lastAsk > 180) { openAsk(); continue; }
                     }
                 } else confusedSince = 0;
             }

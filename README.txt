@@ -703,9 +703,11 @@ CONTENTS
   which stats went up/down at each place - e.g. "wood goes up most
   at Place 3".
 
-  Confused: if nothing it remembers looks like the screen for 1.5 s,
-  it lets go of everything, beeps and asks "What are you doing?" on
-  the HUD. Type an answer and Enter:
+  Confused: asking is OFF by default (it just keeps playing). F10
+  "ask me" turns it on: then, if nothing it remembers looks like the
+  screen for 4 s and it has nothing to do, it lets go of everything,
+  beeps and asks "What are you doing?" (at most every 3 minutes).
+  F10 "don't ask" turns it off again. Type an answer and Enter:
      "running forward", "shooting", "turning around", "looting",
      "jump over", "crouch and sneak left", "drink water", "wait 5"
      -> it does that for a few seconds (number = seconds)
