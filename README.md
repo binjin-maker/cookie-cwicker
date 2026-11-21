@@ -153,6 +153,17 @@ when low on health run away from person
 teach loot: press e then wait 1 then press tab        (run it with: do loot)
 ```
 
+**Chaining with `=>`:** each `=>` part runs after the part before it finishes, but only if its own `if` is true right then (it waits up to 1 s). If it isn't, the rest of the chain is skipped.
+
+```
+if detect enemy then aim at person => if looking at enemy then hold lmb for 200ms
+if see a cow then look at it => if looking at cow then hit 3 times => press e
+```
+
+`looking at <thing>` is true when the crosshair is inside that thing's detection box (`looking at enemy` = any enemy). Explained rules about things on screen (`see`, `enemy`, `looking at`) can fire again after 1.5 s. Recorded ones wait 10 s.
+
+**Aiming:** `look at` / `aim at` work in a loop: turn a bit, wait for a fresh detector frame, measure, and repeat. It learns how far one mouse count turns the view from its own moves. If it loses the target it makes small sweeps toward where it was last seen instead of spinning.
+
 **Conditions:** `when <number> is low / below 30 / empty / high / above 80 / full` · `hungry/thirsty/hurt` · `when you see / detect a <thing>` · `when an enemy is ahead` · `when looking at <thing>` · `every 2 minutes / every 30 seconds` · none = only when you say `do <name>`.
 
 **Steps** (split by `then` or commas):

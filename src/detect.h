@@ -30,6 +30,8 @@ static std::string status = "not loaded";
 static std::mutex mu;
 static std::vector<Box> boxes;
 static double boxesAt = 0, ms = 0, rate = 0;
+static std::vector<Box> rawBoxes;   // this frame only, no smoothing (for aiming)
+static double shotAt = 0;           // when that screenshot was taken
 static int S = 640;
 
 static bool ok(Status s, const char *what) {
