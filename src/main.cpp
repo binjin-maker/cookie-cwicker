@@ -32,7 +32,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 17;
+static const int VERSION = 18;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -59,7 +59,7 @@ static Goal gGoal;
 static void updateGoalHud();
 namespace cc {
 void onKey(DWORD vk, bool down); void onPhys(); bool asking(); HWND target(); void answer(const std::string &s); bool active();
-void start(int m); void stop(); void renderHud(); bool hudWanted(); void init();
+void start(int m); void stop(); void renderHud(); bool hudWanted(); void init(); void openTell();
 extern std::atomic<const char *> stepLoop, stepOcr, stepHud;
 }
 static void processCmds();
@@ -648,7 +648,7 @@ static LRESULT CALLBACK keyHook(int code, WPARAM wp, LPARAM lp) {
     DWORD vk = k->vkCode;
     bool down = wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN;
     if (cc::asking()) {
-        if (GetForegroundWindow() != cc::target() || vk == VK_F6 || vk == VK_F7 || vk == VK_F8 || vk == VK_F9) return CallNextHookEx(nullptr, code, wp, lp);
+        if (GetForegroundWindow() != cc::target() || vk == VK_F6 || vk == VK_F7 || vk == VK_F8 || vk == VK_F9 || vk == VK_F10) return CallNextHookEx(nullptr, code, wp, lp);
         if (!down) return 1;
         std::lock_guard<std::mutex> lk(gPromptMu);
         gPromptLast = now();
@@ -664,6 +664,7 @@ static LRESULT CALLBACK keyHook(int code, WPARAM wp, LPARAM lp) {
         return 1;
     }
     cc::onKey(vk, down);
+    if (vk == VK_F10 && cc::active()) { if (down) cc::openTell(); return 1; }
     if (vk != VK_F6 && vk != VK_F7 && vk != VK_F8 && vk != VK_F9) cc::onPhys();
     bool mods = (GetAsyncKeyState(VK_CONTROL) & 0x8000) || (GetAsyncKeyState(VK_MENU) & 0x8000) || (GetAsyncKeyState(VK_LWIN) & 0x8000);
     if (vk == VK_F8 || vk == VK_F9 || mods) return CallNextHookEx(nullptr, code, wp, lp);

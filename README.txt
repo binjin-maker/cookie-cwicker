@@ -578,10 +578,29 @@ CONTENTS
       It records the game window 30 times a second (tiny 32x18 snapshot
       + colour), every key you hold, mouse buttons and raw mouse
       movement (works with locked FPS cursors). F6 again stops & saves.
-  F7 (or "Let it play")    it plays: each frame it finds the 12 most
-      similar-looking moments it remembers and does what was done
-      there (keys, buttons, mouse turn), weighted toward moments that
-      turned out well.
+  F7 (or "Let it play")    it plays: it finds the remembered moment
+      that looks most like the screen (favouring moments that turned
+      out well) and replays what you did from there for up to ~0.8 s,
+      then re-checks. Following whole moments instead of averaging
+      many keeps its movement smooth instead of jittery.
+  F10   tell it something any time (it pauses while you type):
+      "don't press e" / "never click"   -> rule, it won't press it
+      "you can press e"                 -> undo a rule
+      "this is the base" / "this is a cave"  -> names the current place
+      "this is dangerous" / "this is good"   -> marks this moment
+      "red ones are enemies" / "green ones are friendly"
+                                        -> colour of moving things
+      "3 is the hatchet"                -> names hotbar slot 3
+      or an action ("run forward", "shoot", "turn around").
+      Rules/names are saved in copycat\<game>.rules.
+
+  SAFETY while it plays:
+   - never presses Windows/Alt/Esc/F-keys/Delete/media keys
+   - each key/button changes at most ~6 times a second (no click spam)
+   - mouse turns are capped per frame
+   - if the game window stops being in front, or a visible mouse
+     pointer leaves the game window, it lets go of everything and
+     stops playing completely
       Touch the mouse/keyboard any time and it instantly hands over
       and records you instead; 2 s after you let go it takes back over.
       F7 again stops.
@@ -600,6 +619,18 @@ CONTENTS
 
   Needs: if health/food/water/etc. gets low or keeps dropping, it
   favours moments that raised that stat before ("trying to get").
+
+  Moving things: each frame it removes the camera's own motion and
+  finds what is still moving (players, NPCs, animals, vehicles),
+  with colour and shape (tall = person-like, wide = animal/vehicle-
+  like). Colours that show up right before bad events become
+  "probably enemies"; with an enemy-looking thing ahead it favours
+  moments where you were shooting.
+
+  Tools: when you press 1-9 it learns what the hotbar looks like with
+  that slot picked, so it can tell what you're holding. It notes
+  which tool raised which stat ("slot 2 gets wood") and when it needs
+  that stat it switches to that tool itself.
 
   Places: it groups what the screen looks like into up to 64
   "places" (named by colour, e.g. "Place 4 (mid green)") and notes

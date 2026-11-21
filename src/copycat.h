@@ -66,7 +66,7 @@ double dRef = 0;
 std::mutex amu;
 std::deque<std::string> notes;
 std::vector<std::string> findings;
-std::string goal = "-", confusedTxt = "-", actionTxt = "-", watchTxt = "-", placeTxt = "-";
+std::string goal = "-", confusedTxt = "-", actionTxt = "-", watchTxt = "-", placeTxt = "-", moverTxt = "-";
 double fps = 0, decideMs = 0, ocrMs = 0, confusion = 0, matchPct = 0;
 int demoN = 0, selfN = 0;
 Plan plan;
@@ -157,15 +157,36 @@ static void sendMove(int dx, int dy) {
     INPUT in{}; in.type = INPUT_MOUSE; in.mi.dx = dx; in.mi.dy = dy; in.mi.dwFlags = MOUSEEVENTF_MOVE;
     SendInput(1, &in, sizeof in);
 }
-static void applyOut(const uint8_t *keys, int btn) {
-    for (int vk = 1; vk < 256; vk++) {
-        bool want = hasKey(keys, vk), have = hasKey(heldOut, vk);
-        if (want != have) { sendKey(vk, want); if (want) heldOut[vk >> 3] |= 1 << (vk & 7); else heldOut[vk >> 3] &= ~(1 << (vk & 7)); }
-    }
-    for (int b : {1, 2, 4}) if ((btn & b) != (btnOut & b)) sendBtn(b, btn & b);
-    btnOut = btn;
+static uint8_t banned[32];
+static int bannedBtn = 0;
+static double keyChanged[256], btnChanged[3];
+static bool neverPress(int vk) {
+    return vk == VK_LWIN || vk == VK_RWIN || vk == VK_APPS || vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU || vk == VK_ESCAPE ||
+           (vk >= VK_F1 && vk <= VK_F24) || vk == VK_SNAPSHOT || vk == VK_SLEEP || vk == VK_PAUSE || (vk >= 0xA6 && vk <= 0xB7) || vk == VK_DELETE ||
+           hasKey(banned, vk);
 }
-static void releaseAll() { uint8_t z[32] = {}; applyOut(z, 0); }
+// presses at most ~6 times a second per key/button, never system keys
+static void applyOut(const uint8_t *keys, int btn, bool force = false) {
+    double t = now();
+    for (int vk = 1; vk < 256; vk++) {
+        bool want = hasKey(keys, vk) && !neverPress(vk), have = hasKey(heldOut, vk);
+        if (want == have) continue;
+        if (!force && want && t - keyChanged[vk] < 0.16) continue;
+        if (!force && !want && t - keyChanged[vk] < 0.1) continue;
+        sendKey(vk, want); keyChanged[vk] = t;
+        if (want) heldOut[vk >> 3] |= 1 << (vk & 7); else heldOut[vk >> 3] &= ~(1 << (vk & 7));
+    }
+    btn &= ~bannedBtn;
+    for (int i = 0; i < 3; i++) {
+        int b = 1 << i;
+        bool want = btn & b, have = btnOut & b;
+        if (want == have) continue;
+        if (!force && t - btnChanged[i] < (want ? 0.16 : 0.08)) continue;
+        sendBtn(b, want); btnChanged[i] = t;
+        if (want) btnOut |= b; else btnOut &= ~b;
+    }
+}
+static void releaseAll() { uint8_t z[32] = {}; applyOut(z, 0, true); }
 
 // ---------- seeing ----------
 static bool targetRect(Rect &r) {
@@ -174,6 +195,8 @@ static bool targetRect(Rect &r) {
     r = {p.x, p.y, p.x + c.right, p.y + c.bottom};
     return c.right > 40 && c.bottom > 40;
 }
+const int MW = 64, MH = 36;
+static uint32_t mini[MW * MH];
 static bool capture(uint8_t *f, float &red) {
     Rect r; if (!targetRect(r)) return false;
     const int SW = 256, SH = 144;
@@ -210,8 +233,104 @@ static bool capture(uint8_t *f, float &red) {
     int per = FG / 8;
     for (int i = 0; i < 8; i++) for (int c = 0; c < 3; c++) f[FG + i * 3 + c] = (uint8_t)(tile[i][c] / per);
     red = (float)((tr - (tg + tb) / 2) / FG);
+    for (int y = 0; y < MH; y++)
+        for (int x = 0; x < MW; x++) {
+            int rr = 0, gg = 0, bb = 0;
+            for (int j = 0; j < 4; j++)
+                for (int i = 0; i < 4; i++) { uint32_t p = bits[(y * 4 + j) * SW + x * 4 + i]; rr += (p >> 16) & 255; gg += (p >> 8) & 255; bb += p & 255; }
+            mini[y * MW + x] = ((uint32_t)(rr / 16) << 16) | ((uint32_t)(gg / 16) << 8) | (uint32_t)(bb / 16);
+        }
     return true;
 }
+static int grayOf(uint32_t p) { return (((p >> 16) & 255) * 3 + ((p >> 8) & 255) * 6 + (p & 255)) / 10; }
+
+// ---------- moving things (NPCs, animals, players, vehicles) ----------
+struct Mover { int x, y, w, h, n; int r, g, b; };
+static std::vector<Mover> movers;
+static int moverGood[24], moverBad[24];
+static double lastMoverSeen[24];
+static int colourBin(int r, int g, int b) {
+    int mx = std::max(r, std::max(g, b)), mn = std::min(r, std::min(g, b));
+    int light = mx < 70 ? 0 : mx > 180 ? 2 : 1;
+    int hue;
+    if (mx - mn < 25) hue = 6;  // grey
+    else if (mx == r) hue = g > b ? (g > r * 0.6 ? 1 : 0) : 5;  // red / orange-yellow / magenta
+    else if (mx == g) hue = b > r ? 3 : 2;                         // green / teal
+    else hue = r > g ? 5 : 4;                                      // blue / purple
+    return std::min(23, hue * 3 + light);
+}
+static std::string colourName(int bin) {
+    static const char *hues[] = {"red", "orange/yellow", "green", "teal", "blue", "purple", "grey"};
+    static const char *lights[] = {"dark ", "", "bright "};
+    return std::string(lights[bin % 3]) + hues[std::min(6, bin / 3)];
+}
+static std::string shapeOf(const Mover &m) {
+    double ar = (double)m.h / std::max(1, m.w);
+    std::string sz = m.n > 120 ? "big " : m.n < 12 ? "small " : "";
+    return sz + (ar > 1.6 ? "tall (person-like)" : ar < 0.6 ? "wide (animal/vehicle-like)" : "chunky");
+}
+static void findMovers(const uint32_t *a, const uint32_t *b, int sx, int sy) {
+    // sx,sy is the whole-view shift on the 32x18 grid -> x2 here
+    int dx = sx * 2, dy = sy * 2;
+    static uint8_t mask[MW * MH];
+    memset(mask, 0, sizeof mask);
+    for (int y = 3; y < MH - 3; y++)
+        for (int x = 3; x < MW - 3; x++) {
+            int yy = y + dy, xx = x + dx;
+            if (xx < 0 || yy < 0 || xx >= MW || yy >= MH) continue;
+            if (std::abs(grayOf(a[y * MW + x]) - grayOf(b[yy * MW + xx])) > 45) mask[yy * MW + xx] = 1;
+        }
+    movers.clear();
+    static int st[MW * MH];
+    for (int i = 0; i < MW * MH; i++) {
+        if (mask[i] != 1) continue;
+        Mover m{i % MW, i / MW, 0, 0, 0, 0, 0, 0};
+        int x0 = MW, y0 = MH, x1 = 0, y1 = 0, sp = 0;
+        st[sp++] = i; mask[i] = 2;
+        long rr = 0, gg = 0, bb = 0;
+        while (sp) {
+            int k = st[--sp], kx = k % MW, ky = k / MW;
+            m.n++; x0 = std::min(x0, kx); x1 = std::max(x1, kx); y0 = std::min(y0, ky); y1 = std::max(y1, ky);
+            uint32_t p = b[k]; rr += (p >> 16) & 255; gg += (p >> 8) & 255; bb += p & 255;
+            const int nb[4] = {k - 1, k + 1, k - MW, k + MW};
+            for (int q : nb) if (q >= 0 && q < MW * MH && std::abs(q % MW - kx) <= 1 && mask[q] == 1) { mask[q] = 2; st[sp++] = q; }
+        }
+        if (m.n < 4 || m.n > MW * MH / 4) continue;  // noise, or the whole view changing
+        m.x = (x0 + x1) / 2; m.y = (y0 + y1) / 2; m.w = x1 - x0 + 1; m.h = y1 - y0 + 1;
+        m.r = (int)(rr / m.n); m.g = (int)(gg / m.n); m.b = (int)(bb / m.n);
+        movers.push_back(m);
+    }
+    std::sort(movers.begin(), movers.end(), [](const Mover &p, const Mover &q) { return p.n > q.n; });
+    if (movers.size() > 6) movers.resize(6);
+    double t = now();
+    for (auto &m : movers) lastMoverSeen[colourBin(m.r, m.g, m.b)] = t;
+}
+static bool hostileBin(int bin) { return moverBad[bin] >= 3 && moverBad[bin] > moverGood[bin] * 2; }
+
+// ---------- tools / hotbar ----------
+struct Tool { float sig[MW * 6]; int n = 0; std::string name; int up[MAXSTAT] = {}, uses = 0; };
+static Tool tools[10];
+static int curTool = -1;
+static void hotbarSig(float *out) {
+    for (int y = 0; y < 6; y++) for (int x = 0; x < MW; x++) out[y * MW + x] = (float)grayOf(mini[(MH - 6 + y) * MW + x]);
+}
+static int whichTool() {
+    float s[MW * 6]; hotbarSig(s);
+    int best = -1; double bd = 1e18;
+    for (int i = 1; i <= 9; i++) {
+        if (tools[i].n < 2) continue;
+        double d = 0; for (int k = 0; k < MW * 6; k++) d += std::fabs(tools[i].sig[k] - s[k]);
+        if (d < bd) { bd = d; best = i; }
+    }
+    double second = 1e18;
+    for (int i = 1; i <= 9; i++) {
+        if (i == best || tools[i].n < 2) continue;
+        double d = 0; for (int k = 0; k < MW * 6; k++) d += std::fabs(tools[i].sig[k] - s[k]);
+        second = std::min(second, d);
+    }
+    return (best > 0 && (second == 1e18 || bd < second * 0.85)) ? best : -1;
+}
+static std::string toolName(int i) { return i <= 0 ? "nothing known" : !tools[i].name.empty() ? tools[i].name : "slot " + std::to_string(i); }
 static int dist(const uint8_t *a, const uint8_t *b) {
     int s = 0;
     for (int i = 0; i < FD; i++) s += std::abs((int)a[i] - (int)b[i]);
@@ -293,6 +412,8 @@ static void reward(float r, int statIdx, bool up, const char *why) {
         for (int vk = 1; vk < 256; vk++) if (hasKey(f.keys, vk)) { held += (held.empty() ? "" : "+") + keyName(vk); auto &ks = keyStats[vk]; if (r > 0) ks.good++; else if (r < 0) ks.bad++; }
         if (f.btn & 1) { held += (held.empty() ? "" : "+") + std::string("LMB"); auto &ks = keyStats[1001]; if (r > 0) ks.good++; else if (r < 0) ks.bad++; }
         if (r < 0) { for (int c = 0; c < 3; c++) { double s = 0; for (int i = 0; i < 8; i++) s += f.f[FG + i * 3 + c]; badColor[c] += s / 8; } badColorN++; }
+        for (int bin = 0; bin < 24; bin++) if (t - lastMoverSeen[bin] < 1.5) { if (r < 0) moverBad[bin]++; else if (r > 0) moverGood[bin]++; }
+        if (curTool > 0 && r > 0) { tools[curTool].uses++; if (statIdx >= 0 && statIdx < MAXSTAT && up) tools[curTool].up[statIdx]++; }
         note("%s %s at Place %d%s%s", r > 0 ? "GOOD:" : r < 0 ? "BAD:" : "", why, pl + 1, held.empty() ? "" : " while pressing ", held.c_str());
     }
 }
@@ -409,7 +530,17 @@ static void analyze() {
         for (int c = 0; c < 3; c++) { double d = badColor[c] / badColorN - allColor[c] / allColorN; if (d > bd) { bd = d; bi = c; } }
         if (bd > 8) { char b[120]; snprintf(b, sizeof b, "danger: screens get more %s right before bad stuff", nm[bi]); out.push_back(b); }
     }
-    for (size_t s = 0; s < stats.size() && out.size() < 10; s++) {
+    for (int bin = 0; bin < 24 && out.size() < 10; bin++) {
+        if (hostileBin(bin)) out.push_back(colourName(bin) + " moving things show up before bad stuff - probably enemies (" + std::to_string(moverBad[bin]) + "x)");
+        else if (moverGood[bin] >= 3 && moverGood[bin] > moverBad[bin] * 2) out.push_back(colourName(bin) + " moving things come with good stuff (animals to hunt? loot?)");
+    }
+    for (int i = 1; i <= 9 && out.size() < 12; i++) {
+        if (tools[i].n < 2) continue;
+        int bs = -1, bn = 0;
+        for (size_t s2 = 0; s2 < stats.size() && s2 < MAXSTAT; s2++) if (tools[i].up[s2] > bn) { bn = tools[i].up[s2]; bs = (int)s2; }
+        if (bs >= 0) out.push_back(toolName(i) + " gets " + stats[bs].label + " (" + std::to_string(bn) + "x)");
+    }
+    for (size_t s = 0; s < stats.size() && out.size() < 12; s++) {
         int bestP = -1, bestN = 0;
         for (size_t p = 0; p < places.size(); p++) if (places[p].up[s] > bestN) { bestN = places[p].up[s]; bestP = (int)p; }
         if (bestP >= 0 && bestN >= 2) {
@@ -531,7 +662,137 @@ static void computeRef() {
     dRef = ds.empty() ? FD * 12.0 : std::max(FD * 2.0, (double)ds[ds.size() / 2]);
 }
 
+static std::atomic<bool> telling{false};
+static std::atomic<int> resumeMode{2};
+static size_t eraseGen = 0;
+static int vkFromWord(const std::string &w) {
+    if (w.size() == 1 && isalnum((unsigned char)w[0])) return toupper(w[0]);
+    if (w == "space" || w == "spacebar") return VK_SPACE;
+    if (w == "shift") return VK_SHIFT;
+    if (w == "ctrl" || w == "control") return VK_CONTROL;
+    if (w == "tab") return VK_TAB;
+    if (w == "enter") return VK_RETURN;
+    if (w == "click" || w == "lmb" || w == "shoot" || w == "fire" || w == "mouse") return 1001;
+    if (w == "rmb" || w == "aim") return 1002;
+    return 0;
+}
+static void saveRules() {
+    CreateDirectoryA("copycat", nullptr);
+    std::string p = "copycat\\" + name + ".rules";
+    if (FILE *f = fopen(p.c_str(), "w")) {
+        for (int vk = 1; vk < 256; vk++) if (hasKey(banned, vk)) fprintf(f, "ban %d\n", vk);
+        if (bannedBtn) fprintf(f, "banbtn %d\n", bannedBtn);
+        for (size_t i = 0; i < places.size(); i++) if (places[i].look.rfind("\"", 0) == 0) fprintf(f, "place %d %s\n", (int)i, places[i].look.c_str());
+        for (int i = 1; i <= 9; i++) if (!tools[i].name.empty()) fprintf(f, "toolname %d %s\n", i, tools[i].name.c_str());
+        for (int b = 0; b < 24; b++) if (moverGood[b] || moverBad[b]) fprintf(f, "mover %d %d %d\n", b, moverGood[b], moverBad[b]);
+        fclose(f);
+    }
+    p = "copycat\\" + name + ".tools";
+    if (FILE *f = fopen(p.c_str(), "wb")) {
+        for (int i = 0; i < 10; i++) { fwrite(tools[i].sig, sizeof tools[i].sig, 1, f); fwrite(&tools[i].n, 4, 1, f); fwrite(tools[i].up, sizeof tools[i].up, 1, f); fwrite(&tools[i].uses, 4, 1, f); }
+        fclose(f);
+    }
+}
+static void loadRules() {
+    memset(banned, 0, sizeof banned); bannedBtn = 0;
+    memset(moverGood, 0, sizeof moverGood); memset(moverBad, 0, sizeof moverBad);
+    for (auto &tl : tools) tl = Tool{};
+    std::string p = "copycat\\" + name + ".tools";
+    if (FILE *tf = fopen(p.c_str(), "rb")) {
+        for (int i = 0; i < 10; i++)
+            if (fread(tools[i].sig, sizeof tools[i].sig, 1, tf) != 1 || fread(&tools[i].n, 4, 1, tf) != 1 || fread(tools[i].up, sizeof tools[i].up, 1, tf) != 1 ||
+                fread(&tools[i].uses, 4, 1, tf) != 1) { tools[i] = Tool{}; break; }
+        fclose(tf);
+    }
+    p = "copycat\\" + name + ".rules";
+    FILE *f = fopen(p.c_str(), "r");
+    if (!f) return;
+    char line[300];
+    while (fgets(line, sizeof line, f)) {
+        int v; char nm[260];
+        if (sscanf(line, "ban %d", &v) == 1 && v > 0 && v < 256) banned[v >> 3] |= 1 << (v & 7);
+        else if (sscanf(line, "banbtn %d", &v) == 1) bannedBtn = v;
+        else if (sscanf(line, "place %d %259[^\n]", &v, nm) == 2 && v >= 0 && v < (int)places.size()) places[v].look = nm;
+        else if (sscanf(line, "toolname %d %259[^\n]", &v, nm) == 2 && v >= 1 && v <= 9) tools[v].name = nm;
+        else { int g2, b2; if (sscanf(line, "mover %d %d %d", &v, &g2, &b2) == 3 && v >= 0 && v < 24) { moverGood[v] = g2; moverBad[v] = b2; } }
+    }
+    fclose(f);
+}
+// "don't press e", "this is the base", "this is dangerous" ... returns true if it understood something
+static bool explain(const std::string &raw, int place) {
+    std::string t = lower(raw);
+    for (auto &c : t) if (!isalnum((unsigned char)c) && c != ' ') c = ' ';
+    auto toks = split(t);
+    bool did = false, good = false, bad = false;
+    static const char *banV[] = {"press", "pressing", "use", "using", "click", "clicking", "hit", "hitting", "touch", "push"};
+    bool neg = t.find("don t") != std::string::npos || t.find("dont") != std::string::npos || t.find("never") != std::string::npos ||
+               t.find("stop") != std::string::npos || t.find("no more") != std::string::npos;
+    bool pos = t.find("you can") != std::string::npos || t.find("ok to") != std::string::npos || t.find("allowed") != std::string::npos;
+    for (size_t i = 0; i + 1 < toks.size(); i++)
+        for (auto v : banV)
+            if (toks[i] == v) {
+                int vk = vkFromWord(toks[i + 1]);
+                if (!vk && toks[i + 1] == "left" && i + 2 < toks.size() && toks[i + 2] == "click") vk = 1001;
+                if (!vk && toks[i + 1] == "right" && i + 2 < toks.size() && toks[i + 2] == "click") vk = 1002;
+                if (!vk) continue;
+                if (neg) { if (vk >= 1001) bannedBtn |= vk == 1001 ? 1 : 2; else banned[vk >> 3] |= 1 << (vk & 7); note("rule: never press %s", keyName(vk).c_str()); did = true; }
+                else if (pos) { if (vk >= 1001) bannedBtn &= ~(vk == 1001 ? 1 : 2); else banned[vk >> 3] &= ~(1 << (vk & 7)); note("rule: allowed to press %s again", keyName(vk).c_str()); did = true; }
+            }
+    // "3 is the hatchet", "slot 2 is a pickaxe"
+    for (size_t i = 0; i + 2 < toks.size(); i++) {
+        size_t j = i;
+        if (toks[j] == "slot" && j + 1 < toks.size()) j++;
+        if (toks[j].size() == 1 && toks[j][0] >= '1' && toks[j][0] <= '9' && toks[j + 1] == "is") {
+            size_t k = j + 2;
+            if (k < toks.size() && (toks[k] == "a" || toks[k] == "the" || toks[k] == "my" || toks[k] == "an")) k++;
+            std::string nm;
+            for (; k < toks.size(); k++) nm += (nm.empty() ? "" : " ") + toks[k];
+            if (!nm.empty()) { tools[toks[j][0] - '0'].name = nm; note("tool %c is the %s", toks[j][0], nm.c_str()); did = true; break; }
+        }
+    }
+    {
+        static const char *cw[][2] = {{"red", "0"}, {"orange", "1"}, {"yellow", "1"}, {"green", "2"}, {"teal", "3"}, {"cyan", "3"}, {"blue", "4"},
+                                      {"purple", "5"}, {"pink", "5"}, {"grey", "6"}, {"gray", "6"}, {"white", "6"}, {"black", "6"}};
+        bool enemy = t.find("enem") != std::string::npos || t.find("hostile") != std::string::npos || t.find("bad guy") != std::string::npos ||
+                     t.find("shoot") != std::string::npos || t.find("attack") != std::string::npos || t.find("danger") != std::string::npos;
+        bool friendly = t.find("friend") != std::string::npos || t.find("ally") != std::string::npos || t.find("teammate") != std::string::npos ||
+                        t.find("safe") != std::string::npos || t.find("animal") != std::string::npos;
+        if (enemy != friendly)
+            for (auto &c : cw)
+                if (t.find(c[0]) != std::string::npos) {
+                    int h = c[1][0] - '0';
+                    for (int l = 0; l < 3; l++) { if (enemy) moverBad[h * 3 + l] += 10; else moverGood[h * 3 + l] += 10; }
+                    note("%s moving things are %s", c[0], enemy ? "ENEMIES" : "friendly");
+                    did = true; good = bad = false;
+                }
+    }
+    size_t at = std::string::npos;
+    for (const char *ph : {"this place is ", "this is ", "here is ", "call this ", "this area is "}) if ((at = t.find(ph)) != std::string::npos) { at += strlen(ph); break; }
+    for (const char *w : {"good", "great", "nice", "safe", "loot", "food", "water", "resources", "home", "base", "friendly", "friend"}) if (t.find(w) != std::string::npos) good = true;
+    for (const char *w : {"bad", "danger", "enemy", "enemies", "avoid", "die", "death", "kill you", "hostile", "trap", "radiation", "hurts"}) if (t.find(w) != std::string::npos) bad = true;
+    if (at != std::string::npos && place >= 0 && place < (int)places.size() && !good && !bad) {
+        std::string nm = raw.substr(std::min(raw.size(), at));
+        if (!nm.empty()) { places[place].look = "\"" + nm + "\""; note("named Place %d: %s", place + 1, nm.c_str()); did = true; }
+    }
+    if (good != bad && !did) {
+        reward(good ? 2.5f : -2.5f, -1, good, (std::string("you said: ") + raw).c_str());
+        if (at != std::string::npos && place >= 0 && place < (int)places.size()) places[place].look = "\"" + raw.substr(std::min(raw.size(), at)) + "\"";
+        did = true;
+    }
+    if (did) saveRules();
+    return did;
+}
+void openTell() {
+    if (mode != 1 && mode != 2) return;
+    resumeMode = (int)mode;
+    telling = true;
+    mode = 3;
+    releaseAll();
+    { std::lock_guard<std::mutex> lk(gPromptMu); gPromptText.clear(); gPromptOpen = true; gPromptLast = now(); }
+}
+
 static void openAsk() {
+    telling = false;
     mode = 3;
     releaseAll();
     { std::lock_guard<std::mutex> lk(gPromptMu); gPromptText.clear(); gPromptOpen = true; gPromptLast = now(); }
@@ -540,77 +801,71 @@ static void openAsk() {
     lastAsk = now();
 }
 
-static void decide(const uint8_t *f, uint8_t *keysOut, int &btn, int &mdx, int &mdy) {
-    memset(keysOut, 0, 32); btn = 0; mdx = mdy = 0;
+static int wantTool = -1;
+static long decide(const uint8_t *f) {
     double t0 = now();
     struct Hit { int d; size_t i; };
     std::vector<Hit> top;
     std::vector<int> needIdx;
     uint32_t needMask = 0;
+    long pick = -1;
     {
         std::lock_guard<std::mutex> lk(mu);
         for (size_t s = 0; s < stats.size(); s++)
             if (stats[s].need && stats[s].seen > 2 && stats[s].maxSeen > 0 && (stats[s].last < stats[s].maxSeen * 0.55 || stats[s].trend < -0.5)) needIdx.push_back((int)s);
         for (int s : needIdx) if (s < 32) needMask |= 1u << s;
-        if (data.size() < 60) { std::lock_guard<std::mutex> l2(amu); goal = "need more recording - press F6 and play for a bit"; return; }
-        double tNow = now();
-        for (size_t i = 0; i < data.size(); i++) {
-            if (data[i].self && tNow - data[i].t < 2.0) continue;
-            int d = dist(f, data[i].f);
-            if ((int)top.size() < K) { top.push_back({d, i}); std::push_heap(top.begin(), top.end(), [](const Hit &a, const Hit &b) { return a.d < b.d; }); }
-            else if (d < top.front().d) {
-                std::pop_heap(top.begin(), top.end(), [](const Hit &a, const Hit &b) { return a.d < b.d; });
-                top.back() = {d, i};
-                std::push_heap(top.begin(), top.end(), [](const Hit &a, const Hit &b) { return a.d < b.d; });
-            }
+        if (data.size() < 60) { std::lock_guard<std::mutex> l2(amu); goal = "need more recording - press F6 and play for a bit"; return -1; }
+        auto cmp = [](const Hit &a, const Hit &b) { return a.d < b.d; };
+        for (size_t i = 0; i + 1 < data.size(); i++) {
+            const Frame &fr = data[i];
+            if (fr.self && fr.value < 0.5) continue;  // only follow my own moves if they paid off
+            if (data[i + 1].t - fr.t > 0.2) continue;  // needs a continuation to follow
+            int d = dist(f, fr.f);
+            if ((int)top.size() < K) { top.push_back({d, i}); std::push_heap(top.begin(), top.end(), cmp); }
+            else if (d < top.front().d) { std::pop_heap(top.begin(), top.end(), cmp); top.back() = {d, i}; std::push_heap(top.begin(), top.end(), cmp); }
         }
-        if (top.empty()) return;
+        if (top.empty()) return -1;
         int dmin = INT_MAX; for (auto &h : top) dmin = std::min(dmin, h.d);
         confusion = dmin / std::max(1.0, dRef);
         matchPct = std::max(0.0, 100.0 * (1.0 - dmin / (FD * 60.0)));
-        double ks[256] = {}, bs[3] = {}, W = 0, mx = 0, my = 0, val = 0;
+        bool enemyNear = false;
+        for (auto &mv : movers)
+            if (hostileBin(colourBin(mv.r, mv.g, mv.b)) && std::abs(mv.x - MW / 2) < MW / 4 && std::abs(mv.y - MH / 2) < MH / 3) enemyNear = true;
+        wantTool = -1;
+        if (!needIdx.empty()) {
+            int bn = 0;
+            for (int i = 1; i <= 9; i++) if (tools[i].n >= 2 && tools[i].up[needIdx[0]] > bn) { bn = tools[i].up[needIdx[0]]; wantTool = i; }
+        }
+        double best = -1, val = 0, W = 0;
         for (auto &h : top) {
             const Frame &fr = data[h.i];
-            double w = std::exp(-(h.d - dmin) / (dRef * 0.5 + 1)) * std::max(0.1, std::min(3.0, 1.0 + fr.value)) * (fr.self ? 0.6 : 1.0);
+            double w = std::exp(-(h.d - dmin) / (dRef * 0.5 + 1)) * std::max(0.1, std::min(3.0, 1.0 + fr.value));
             if (needMask && (fr.up & needMask)) w *= 3;
             if (needMask && (fr.down & needMask)) w *= 0.4;
+            if (enemyNear && (fr.btn & 1)) w *= 2.5;
             W += w; val += w * fr.value;
-            for (int vk = 1; vk < 256; vk++) if (hasKey(fr.keys, vk)) ks[vk] += w;
-            for (int b = 0; b < 3; b++) if (fr.btn & (1 << b)) bs[b] += w;
-            mx += w * fr.dx; my += w * fr.dy;
+            if (w > best) { best = w; pick = (long)h.i; }
         }
-        if (W <= 0) return;
-        static double prevKs[256], prevBs[3];
-        std::string act;
-        for (int vk = 1; vk < 256; vk++) {
-            double p = ks[vk] / W, th = prevKs[vk] > 0.5 ? 0.42 : 0.58;
-            prevKs[vk] = p;
-            if (p > th) { keysOut[vk >> 3] |= 1 << (vk & 7); act += keyName(vk) + " "; }
-        }
-        for (int b = 0; b < 3; b++) {
-            double p = bs[b] / W, th = prevBs[b] > 0.5 ? 0.42 : 0.58;
-            prevBs[b] = p;
-            if (p > th) { btn |= 1 << b; act += b == 0 ? "LMB " : b == 1 ? "RMB " : "MMB "; }
-        }
-        mdx = (int)std::lround(mx / W); mdy = (int)std::lround(my / W);
-        if (rand() % 100 < 4) { mdx += (rand() % 41) - 20; act += "(trying something) "; }
         std::string g;
         if (!needIdx.empty()) {
-            const Stat &s = stats[needIdx[0]];
+            const Stat &st = stats[needIdx[0]];
             int bestP = -1, bestN = 0;
             for (size_t p = 0; p < places.size(); p++) if (places[p].up[needIdx[0]] > bestN) { bestN = places[p].up[needIdx[0]]; bestP = (int)p; }
             char b[200];
-            snprintf(b, sizeof b, "%s is low (%s) - doing what raised it before%s", s.label.c_str(), fmtNum(s.last).c_str(),
+            snprintf(b, sizeof b, "%s is low (%s) - doing what raised it before%s", st.label.c_str(), fmtNum(st.last).c_str(),
                      bestP >= 0 ? (" (Place " + std::to_string(bestP + 1) + ")").c_str() : "");
             g = b;
-        } else if (val / W > 0.3) g = "heading for something good (similar moments paid off)";
-        else if (val / W < -0.3) g = "careful - similar moments went badly";
-        else g = "copying what you did here";
+            if (wantTool > 0) g += " with " + toolName(wantTool);
+        } else if (enemyNear) g = "enemy-looking thing ahead - fighting like you did";
+        else if (W > 0 && val / W > 0.3) g = "heading for something good (similar moments paid off)";
+        else if (W > 0 && val / W < -0.3) g = "careful - similar moments went badly";
+        else g = "replaying what you did in a moment like this";
         std::lock_guard<std::mutex> l2(amu);
-        goal = g; actionTxt = act.empty() ? "nothing" : act;
+        goal = g;
         confusedTxt = confusion > 2.2 ? "very - this doesn't look like anything I've seen" : confusion > 1.5 ? "a bit - closest memory is a loose match" : "no";
     }
     decideMs = (now() - t0) * 1000;
+    return pick;
 }
 
 static void loop() {
@@ -627,7 +882,11 @@ static void loop() {
         if (now() - next > 0.2) next = now();
         if (now() - lastSec >= 1) { fps = frames / (now() - lastSec); frames = 0; lastSec = now(); }
         if (!IsWindow(tgt)) { note("the game window closed - stopping"); mode = 0; break; }
-        if (GetForegroundWindow() != tgt) { releaseAll(); continue; }
+        if (GetForegroundWindow() != tgt) {
+            releaseAll();
+            if (mode == 2 && !takeover) { note("the game isn't in front anymore - stopped playing for safety"); logf("Copycat stopped: game window lost focus"); mode = 0; break; }
+            continue;
+        }
         uint8_t f[FD]; float red;
         stepLoop = "capture";
         if (!capture(f, red)) continue;
@@ -644,6 +903,13 @@ static void loop() {
         stepLoop = "motion";
         int sx = 0, sy = 0; double change = 0;
         if (havePrev) shiftOf(prev, f, sx, sy, change);
+        {
+            static uint32_t prevMini[MW * MH];
+            std::lock_guard<std::mutex> lk(mu);
+            if (havePrev) findMovers(prevMini, mini, sx, sy);
+            memcpy(prevMini, mini, sizeof prevMini);
+            if (frames % 5 == 0) curTool = whichTool();
+        }
         memcpy(prev, f, FD); havePrev = true;
 
         int m = mode;
@@ -652,13 +918,21 @@ static void loop() {
             std::string a;
             { std::lock_guard<std::mutex> lk(amu); if (!answers.empty()) { a = answers.front(); answers.pop_front(); } }
             if (!a.empty()) {
-                plan = parseAnswer(a);
-                Memory mm; memcpy(mm.f, f, FD); mm.text = a;
-                { std::lock_guard<std::mutex> lk(mu); mems.push_back(mm); }
-                note("you said: \"%s\" -> %s", a.c_str(), plan.show ? "watching you for 15 s" : "doing that now");
-                if (plan.show) showUntil = now() + 15;
+                int pl = -1;
+                { std::lock_guard<std::mutex> lk(mu); if (!data.empty()) pl = data.back().place; }
+                bool understood = explain(a, pl);
+                Plan pp = parseAnswer(a);
+                bool act = pp.show || !pp.keys.empty() || pp.btn || pp.mdx != 0 || (!understood && !telling);
+                if (act) {
+                    plan = pp;
+                    Memory mm; memcpy(mm.f, f, FD); mm.text = a;
+                    { std::lock_guard<std::mutex> lk(mu); mems.push_back(mm); }
+                    if (plan.show) showUntil = now() + 15;
+                }
+                note("you said: \"%s\" -> %s", a.c_str(), plan.show && act ? "watching you for 15 s" : act ? "doing that now" : understood ? "noted" : "noted (didn't understand it as an action)");
                 confusedSince = 0;
-                mode = 2;
+                mode = telling ? (int)resumeMode : 2;
+                telling = false;
             }
             continue;
         }
@@ -672,8 +946,30 @@ static void loop() {
             for (int i = 0; i < 4; i++) { uint64_t b = keyBits[i]; memcpy(fr.keys + i * 8, &b, 8); }
             fr.btn = (uint8_t)btnState; fr.dx = (int16_t)std::max(-3000, std::min(3000, dxr)); fr.dy = (int16_t)std::max(-3000, std::min(3000, dyr));
             fr.self = 0;
+            // you pressed a number key -> remember what the hotbar looks like with that slot picked
+            static uint8_t lastKeys[32]; static int pendTool = 0; static double pendAt = 0;
+            for (int d = 1; d <= 9; d++) if (hasKey(fr.keys, '0' + d) && !hasKey(lastKeys, '0' + d)) { pendTool = d; pendAt = now() + 0.35; }
+            memcpy(lastKeys, fr.keys, 32);
+            if (pendTool && now() > pendAt) {
+                std::lock_guard<std::mutex> lk(mu);
+                float sg[MW * 6]; hotbarSig(sg);
+                Tool &tl = tools[pendTool];
+                float a = tl.n ? std::max(0.1f, 1.f / (tl.n + 1)) : 1.f;
+                for (int k = 0; k < MW * 6; k++) tl.sig[k] += (sg[k] - tl.sig[k]) * a;
+                if (tl.n++ == 1) note("learned what the hotbar looks like with %s picked", toolName(pendTool).c_str());
+                pendTool = 0;
+            }
         } else {
-            uint8_t ko[32]; int b, mx, my;
+            uint8_t ko[32]; int b = 0, mx = 0, my = 0;
+            memset(ko, 0, 32);
+            // never act if a visible cursor has wandered outside the game
+            CURSORINFO ci{sizeof ci}; Rect cr;
+            if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) && targetRect(cr) && !inRect(ci.ptScreenPos.x, ci.ptScreenPos.y, cr)) {
+                releaseAll();
+                note("the mouse left the game window - stopped playing for safety");
+                logf("Copycat stopped: cursor left the game window");
+                mode = 0; break;
+            }
             bool planOn = now() < plan.until && !plan.show;
             if (planOn) {
                 memset(ko, 0, 32);
@@ -682,7 +978,28 @@ static void loop() {
                 std::lock_guard<std::mutex> lk(amu); goal = "doing what you said: \"" + plan.text + "\""; actionTxt = "following your answer";
             } else {
                 stepLoop = "decide";
-                decide(f, ko, b, mx, my);
+                static long clipIdx = -1; static int clipLeft = 0; static size_t clipGen = 0;
+                bool repick = clipLeft <= 0 || clipIdx < 0 || clipGen != eraseGen;
+                if (!repick) { std::lock_guard<std::mutex> lk(mu); repick = clipIdx >= (long)data.size() || dist(f, data[clipIdx].f) > dRef * 2.6; }
+                if (repick || frames % 10 == 0) {
+                    long p = decide(f);
+                    if (repick) { clipIdx = p; clipLeft = 24; clipGen = eraseGen; }
+                }
+                std::string act;
+                if (clipIdx >= 0) {
+                    std::lock_guard<std::mutex> lk(mu);
+                    if (clipIdx < (long)data.size()) {
+                        const Frame &src = data[clipIdx];
+                        memcpy(ko, src.keys, 32); b = src.btn;
+                        mx = std::max(-80, std::min(80, (int)src.dx)); my = std::max(-80, std::min(80, (int)src.dy));
+                        for (int vk = 1; vk < 256; vk++) if (hasKey(ko, vk)) act += keyName(vk) + " ";
+                        if (b & 1) act += "LMB "; if (b & 2) act += "RMB ";
+                        long nx = clipIdx + 1;
+                        if (nx < (long)data.size() && data[nx].t - src.t < 0.2 && data[nx].self == src.self) { clipIdx = nx; clipLeft--; }
+                        else clipLeft = 0;
+                    }
+                }
+                { std::lock_guard<std::mutex> lk(amu); actionTxt = act.empty() ? "nothing" : act + " (following a moment from memory)"; }
                 if (confusion > 2.2) {
                     if (confusedSince == 0) confusedSince = now();
                     if (now() - confusedSince > 1.5) {
@@ -696,6 +1013,12 @@ static void loop() {
                     }
                 } else confusedSince = 0;
             }
+            static double lastSwitch = 0; static int switchFrames = 0, switchKey = 0;
+            if (!planOn && wantTool > 0 && curTool != wantTool && now() - lastSwitch > 4 && !hasKey(banned, '0' + wantTool)) {
+                switchKey = '0' + wantTool; switchFrames = 5; lastSwitch = now();
+                note("switching to %s", toolName(wantTool).c_str());
+            }
+            if (switchFrames > 0) { switchFrames--; ko[switchKey >> 3] |= 1 << (switchKey & 7); }
             stepLoop = "press keys";
             applyOut(ko, b);
             sendMove(mx, my);
@@ -712,6 +1035,7 @@ static void loop() {
             if (data.size() > MAXFRAMES) {
                 auto it = std::find_if(data.begin(), data.end(), [](const Frame &x) { return x.self; });
                 data.erase(it != data.end() ? it : data.begin());
+                eraseGen++;
             }
             if (watching) {
                 int held = 0;
@@ -735,7 +1059,15 @@ static void loop() {
                 aimAllSum += sp; aimAllN++;
             }
             std::lock_guard<std::mutex> l2(amu);
-            placeTxt = "Place " + std::to_string(fr.place + 1) + " (" + places[fr.place].look + ")";
+            placeTxt = "Place " + std::to_string(fr.place + 1) + " (" + places[fr.place].look + ")   holding: " + toolName(curTool);
+            std::string mv;
+            for (size_t i = 0; i < movers.size() && i < 3; i++) {
+                const Mover &q = movers[i];
+                int bin = colourBin(q.r, q.g, q.b);
+                bool mid = std::abs(q.x - MW / 2) < MW / 4 && std::abs(q.y - MH / 2) < MH / 3;
+                mv += (mv.empty() ? "" : ", ") + colourName(bin) + " " + shapeOf(q) + (mid ? " ahead" : q.x < MW / 2 ? " left" : " right") + (hostileBin(bin) ? " [ENEMY?]" : "");
+            }
+            moverTxt = mv.empty() ? "nothing moving" : mv;
             if (watching) { actionTxt = "recording you"; if (m == 1) goal = "learning what you do"; }
         }
         if (now() - lastAnalyze > 2) { stepLoop = "analyze"; analyze(); lastAnalyze = now(); }
@@ -743,6 +1075,7 @@ static void loop() {
         stepLoop = "wait";
     }
     releaseAll();
+    if (!mode) { analyze(); fileSave(); }
 }
 
 static std::thread worker;
@@ -775,6 +1108,7 @@ void start(int m) {
     }
     { std::lock_guard<std::mutex> lk(mu); demoN = 0; selfN = 0; for (auto &d : data) (d.self ? selfN : demoN)++; }
     computeRef();
+    { std::lock_guard<std::mutex> lk(mu); loadRules(); }
     memset(heldOut, 0, sizeof heldOut); btnOut = 0;
     for (auto &b : keyBits) b = 0;
     rawDx = 0; rawDy = 0; takeover = false; plan = Plan{}; showUntil = 0; confusedSince = 0;
@@ -829,8 +1163,8 @@ void renderHud() {
         DrawTextW(dc, w.c_str(), -1, &r, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     };
     COLORREF white = RGB(240, 244, 255), dim = RGB(150, 160, 185), lab = RGB(110, 150, 220), hot = RGB(ar, ag, ab);
-    std::string g, ct, at, wt, pt; std::deque<std::string> ns; std::vector<std::string> fs;
-    { std::lock_guard<std::mutex> lk(amu); g = goal; ct = confusedTxt; at = actionTxt; wt = watchTxt; pt = placeTxt; ns = notes; fs = findings; }
+    std::string g, ct, at, wt, pt, mt; std::deque<std::string> ns; std::vector<std::string> fs;
+    { std::lock_guard<std::mutex> lk(amu); g = goal; ct = confusedTxt; at = actionTxt; wt = watchTxt; pt = placeTxt; mt = moverTxt; ns = notes; fs = findings; }
     std::string modeTxt = m == 1 ? "WATCHING YOU" : m == 3 ? "ASKING YOU" : takeover ? "YOU'RE DRIVING - RECORDING" : "PLAYING ON ITS OWN";
     text(fT, white, 18, 12, "COOKIEBOT COPYCAT");
     text(fB, hot, 220, 16, modeTxt);
@@ -844,10 +1178,12 @@ void renderHud() {
     text(fS, white, 130, 87, wt);
     text(fL, lab, 18, 108, "WHERE");
     text(fS, white, 130, 107, pt);
-    text(fL, lab, 18, 128, "ANALYZING");
-    int y = 127;
+    text(fL, lab, 18, 128, "MOVING");
+    text(fS, white, 130, 127, mt);
+    text(fL, lab, 18, 148, "ANALYZING");
+    int y = 147;
     if (fs.empty()) { text(fS, dim, 130, y, "not enough data yet"); y += 16; }
-    for (auto &s : fs) { text(fS, white, 130, y, s); y += 16; if (y > 240) break; }
+    for (auto &s : fs) { text(fS, white, 130, y, s); y += 16; if (y > 232) break; }
     text(fL, lab, 18, 250, "TRYING TO GET");
     text(fS, white, 130, 249, g);
     text(fL, lab, 18, 270, "DOING");
@@ -860,8 +1196,8 @@ void renderHud() {
     for (auto it = ns.rbegin(); it != ns.rend() && y < 440; ++it) { text(fS, dim, 130, y, *it); y += 16; }
     std::string pr; bool po;
     { std::lock_guard<std::mutex> lk(gPromptMu); pr = gPromptText; po = gPromptOpen; }
-    if (m == 3) text(fB, hot, 18, 470, "What are you doing?  > " + pr + (std::fmod(now(), 1.0) < 0.55 ? "_" : " "));
-    else text(fS, dim, 18, 474, m == 1 ? "F6 stop watching  -  F7 let it play" : "touch mouse/keys to take over  -  F7 stop  -  F6 just watch");
+    if (m == 3) text(fB, hot, 18, 470, std::string(telling ? "Tell me something" : "What are you doing?") + "  > " + pr + (std::fmod(now(), 1.0) < 0.55 ? "_" : " "));
+    else text(fS, dim, 18, 474, m == 1 ? "F6 stop watching  -  F7 let it play  -  F10 tell it something" : "touch mouse/keys to take over  -  F7 stop  -  F10 tell it something");
     (void)po;
     GdiFlush();
     const uint32_t *tp = (const uint32_t *)bits;
