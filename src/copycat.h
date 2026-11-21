@@ -1268,7 +1268,8 @@ static std::vector<Cmd> parseScript(const std::string &raw, int defCls = -1) {
         if (has(" hold ")) {
             size_t q = p.find(" hold ") + 6; std::string w = p.substr(q); w = w.substr(0, w.find(' '));
             Cmd h; h.type = C_HOLD; h.secs = n > 0 ? n : 1;
-            if (w == "right" || has(" right click") || has(" rmb") || w == "aim") h.btn = 2;
+            if (w == "the") { std::string r2 = p.substr(q + 4); w = r2.substr(0, r2.find(' ')); }
+            if (w == "right" || has(" right click") || has(" rmb") || has(" right mouse") || w == "aim" || w == "m2" || w == "mouse2") h.btn = 2;
             else if (w == "click" || w == "left" || w == "lmb" || w == "mouse" || w == "fire" || w == "shoot" || w == "attack") h.btn = 1;
             else { int vk = vkFromWord(w); if (vk > 0 && vk < 256) h.vk = vk; else if (vk == 1001) h.btn = 1; else if (vk == 1002) h.btn = 2; }
             if (h.btn || h.vk) { out.push_back(h); continue; }
@@ -1297,7 +1298,8 @@ static std::vector<Cmd> parseScript(const std::string &raw, int defCls = -1) {
             c.sprint = has(" run") || has(" sprint"); c.secs = n > 0 ? n : 1.5;
         }
         else if (has(" hit") || has(" attack") || has(" shoot") || has(" chop") || has(" mine") || has(" punch") || has(" click") || has(" swing") || has(" fire")) {
-            c.type = C_CLICK; c.btn = 1; if (times && n > 0) c.times = (int)n; else c.secs = n > 0 ? n : 1;
+            c.type = C_CLICK; c.btn = (has(" rmb") || has(" right click") || has(" right mouse") || has(" mouse2") || has(" m2")) ? 2 : 1;
+            if (times && n > 0) c.times = (int)n; else c.secs = n > 0 ? n : (has(" click") ? 0.1 : 1);
         }
         else if (has(" aim") || has(" scope") || has(" block")) { c.type = C_HOLD; c.btn = 2; c.secs = n > 0 ? n : 1; }
         else if (has(" jump")) { c.type = C_TAP; c.vk = VK_SPACE; c.times = n > 0 ? (int)n : 1; }
@@ -1891,8 +1893,8 @@ static void loop() {
                         break;
                     }
                     case C_CLICK:
-                        if (c.times > 0) { double ph = std::fmod(el, 0.35); b = ph < 0.18 ? 1 : 0; if (el > c.times * 0.35) done = true; }
-                        else { b = 1; if (el > c.secs) done = true; }
+                        if (c.times > 0) { double ph = std::fmod(el, 0.35); b = ph < 0.18 ? c.btn : 0; if (el > c.times * 0.35) done = true; }
+                        else { b = c.btn; if (el > std::max(0.17, c.secs)) done = true; }
                         what = "hit"; break;
                     case C_HOLD: if (c.btn) b = c.btn; else ko[c.vk >> 3] |= 1 << (c.vk & 7); done = el > c.secs; what = "hold"; break;
                     case C_TAP: { double ph = std::fmod(el, 0.3); if (ph < 0.12) ko[c.vk >> 3] |= 1 << (c.vk & 7); if (el > c.times * 0.3) done = true; what = "press " + keyName(c.vk); break; }

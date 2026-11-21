@@ -721,7 +721,10 @@ CONTENTS
       turn left/right/up/down N, turn around
       walk/run forward/back/left/right [N seconds]
       walk until close / walk to it     keeps steering at the thing
-      hit/attack/click [N seconds | N times], aim/crouch [N seconds]
+      click / click lmb / click rmb / right click   (one click)
+      click x3 / click rmb 3 times / hit for 2 seconds
+      hold lmb for 500ms / hold rmb for 2s / hold w for 1.5 seconds
+      aim/crouch [N seconds]
       press <key> [N times], use/loot/eat (E), jump, reload, wait N
       do <other task>
     "it"/"them" means the thing from the "when". Things = anything the
