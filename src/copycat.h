@@ -2,12 +2,15 @@
 // F6 = watch me (records you), F7 = copy me (plays, and keeps learning from its own runs).
 namespace cc {
 
-const int FW = 32, FH = 18, FG = FW * FH, FD = FG + 24;
+// eyes: 64x36 grey view + 8 colour tiles + a sharp 24x24 crosshair close-up (from the full-res screen)
+const int FW = 64, FH = 36, FG = FW * FH, FC = FG + 24, CPW = 24, FD = ((FC + CPW * CPW + 15) / 16) * 16;
+const int TW = 16, TH = 9, TN = TW * TH;  // tiny thumbnail for a fast first-pass search
 const int K = 12, MAXSTAT = 32, MAXPLACE = 64;
-const size_t MAXFRAMES = 60000;
+const size_t MAXFRAMES = 40000;
 
 struct Frame {
     uint8_t f[FD];
+    uint8_t thumb[TN];
     uint8_t keys[32];
     uint8_t btn;
     uint8_t self;
@@ -200,8 +203,9 @@ static uint32_t mini[MW * MH];
 static int16_t center[256];
 static int centerRGB[3];
 static int grayOf0(uint32_t p) { return (((p >> 16) & 255) * 3 + ((p >> 8) & 255) * 6 + (p & 255)) / 10; }
-static bool capture(uint8_t *f, float &red) {
+static bool capture(uint8_t *f, uint8_t *thumb, float &red) {
     Rect r; if (!targetRect(r)) return false;
+    memset(f, 0, FD);
     const int SW = 256, SH = 144;
     static HDC mem = nullptr; static HBITMAP bmp = nullptr; static uint32_t *bits = nullptr;
     HDC scr = GetDC(nullptr);
@@ -236,6 +240,40 @@ static bool capture(uint8_t *f, float &red) {
     int per = FG / 8;
     for (int i = 0; i < 8; i++) for (int c = 0; c < 3; c++) f[FG + i * 3 + c] = (uint8_t)(tile[i][c] / per);
     red = (float)((tr - (tg + tb) / 2) / FG);
+    // sharp close-up of the crosshair area, straight from the full-res screen
+    {
+        static HDC cm = nullptr; static uint32_t *cb = nullptr;
+        HDC scr2 = GetDC(nullptr);
+        if (!cm) {
+            cm = CreateCompatibleDC(scr2);
+            BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth = CPW * 2; bi.bmiHeader.biHeight = -CPW * 2; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+            HBITMAP b2 = CreateDIBSection(cm, &bi, DIB_RGB_COLORS, (void **)&cb, nullptr, 0);
+            SelectObject(cm, b2);
+        }
+        int side = std::max(48, std::min(r.x1 - r.x0, r.y1 - r.y0) / 4);
+        int cx0 = (r.x0 + r.x1) / 2 - side / 2, cy0 = (r.y0 + r.y1) / 2 - side / 2;
+        SetStretchBltMode(cm, HALFTONE); SetBrushOrgEx(cm, 0, 0, nullptr);
+        StretchBlt(cm, 0, 0, CPW * 2, CPW * 2, scr2, cx0, cy0, side, side, SRCCOPY);
+        GdiFlush();
+        ReleaseDC(nullptr, scr2);
+        for (int y = 0; y < CPW; y++)
+            for (int x = 0; x < CPW; x++) {
+                int g = 0;
+                for (int j = 0; j < 2; j++)
+                    for (int i = 0; i < 2; i++) {
+                        uint32_t p = cb[(y * 2 + j) * CPW * 2 + x * 2 + i];
+                        g += (((p >> 16) & 255) * 3 + ((p >> 8) & 255) * 6 + (p & 255)) / 10;
+                    }
+                f[FC + y * CPW + x] = (uint8_t)(g / 4);
+            }
+    }
+    for (int y = 0; y < TH; y++)
+        for (int x = 0; x < TW; x++) {
+            int g = 0;
+            for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++) g += f[(y * 4 + j) * FW + x * 4 + i];
+            thumb[y * TW + x] = (uint8_t)(g / 16);
+        }
     for (int y = 0; y < MH; y++)
         for (int x = 0; x < MW; x++) {
             int rr = 0, gg = 0, bb = 0;
@@ -286,7 +324,7 @@ static std::string shapeOf(const Mover &m) {
 }
 static void findMovers(const uint32_t *a, const uint32_t *b, int sx, int sy) {
     // sx,sy is the whole-view shift on the 32x18 grid -> x2 here
-    int dx = sx * 2, dy = sy * 2;
+    int dx = sx * MW / FW, dy = sy * MH / FH;
     static uint8_t mask[MW * MH];
     memset(mask, 0, sizeof mask);
     for (int y = 3; y < MH - 3; y++)
@@ -376,17 +414,24 @@ static double lastHitAt = 0;
 
 static std::string toolName(int i) { return i <= 0 ? "nothing known" : !tools[i].name.empty() ? tools[i].name : "slot " + std::to_string(i); }
 static int dist(const uint8_t *a, const uint8_t *b) {
-    int s = 0;
-    for (int i = 0; i < FD; i++) s += std::abs((int)a[i] - (int)b[i]);
-    return s;
+    __m128i acc = _mm_setzero_si128();
+    for (int i = 0; i < FD; i += 16)
+        acc = _mm_add_epi64(acc, _mm_sad_epu8(_mm_loadu_si128((const __m128i *)(a + i)), _mm_loadu_si128((const __m128i *)(b + i))));
+    return (int)(_mm_cvtsi128_si64(acc) + _mm_cvtsi128_si64(_mm_unpackhi_epi64(acc, acc)));
+}
+static int distThumb(const uint8_t *a, const uint8_t *b) {
+    __m128i acc = _mm_setzero_si128();
+    for (int i = 0; i < TN; i += 16)
+        acc = _mm_add_epi64(acc, _mm_sad_epu8(_mm_loadu_si128((const __m128i *)(a + i)), _mm_loadu_si128((const __m128i *)(b + i))));
+    return (int)(_mm_cvtsi128_si64(acc) + _mm_cvtsi128_si64(_mm_unpackhi_epi64(acc, acc)));
 }
 static void shiftOf(const uint8_t *a, const uint8_t *b, int &sx, int &sy, double &change) {
     int best = INT_MAX; sx = sy = 0;
-    for (int dy = -2; dy <= 2; dy++)
-        for (int dx = -3; dx <= 3; dx++) {
+    for (int dy = -4; dy <= 4; dy++)
+        for (int dx = -6; dx <= 6; dx++) {
             int s = 0, n = 0;
-            for (int y = 3; y < FH - 3; y++)
-                for (int x = 4; x < FW - 4; x++) { s += std::abs((int)a[y * FW + x] - (int)b[(y + dy) * FW + x + dx]); n++; }
+            for (int y = 5; y < FH - 5; y += 2)
+                for (int x = 7; x < FW - 7; x++) { s += std::abs((int)a[y * FW + x] - (int)b[(y + dy) * FW + x + dx]); n++; }
             s = s * 100 / n;
             if (s < best) { best = s; sx = dx; sy = dy; }
         }
@@ -604,7 +649,7 @@ static void analyze() {
         char b[200];
         std::string what;
         if (kv.first >= 1000) what = "";
-        else if (ch > base * 1.6) what = std::abs(sx) > 0.4 ? (sx > 0 ? "moves/turns you (view slides right)" : "moves/turns you (view slides left)") : "moves you or changes the view a lot";
+        else if (ch > base * 1.6) what = std::abs(sx) > 0.8 ? (sx > 0 ? "moves/turns you (view slides right)" : "moves/turns you (view slides left)") : "moves you or changes the view a lot";
         else if (ch < base * 0.8) what = "doesn't change the view much (action/menu?)";
         else what = "small effect on the view";
         snprintf(b, sizeof b, "%s: %s%s%s good %d / bad %d", n.c_str(), what.c_str(), what.empty() ? "" : " -", k.presses ? (" pressed " + std::to_string(k.presses) + "x,").c_str() : "", k.good, k.bad);
@@ -692,7 +737,7 @@ static void fileSave() {
     std::string p = "copycat\\" + name + ".rec";
     std::lock_guard<std::mutex> lk(mu);
     if (FILE *f = fopen(p.c_str(), "wb")) {
-        uint32_t magic = 0x31424343, n = (uint32_t)data.size(), np = (uint32_t)places.size(), nm = (uint32_t)mems.size();
+        uint32_t magic = 0x32424343, n = (uint32_t)data.size(), np = (uint32_t)places.size(), nm = (uint32_t)mems.size();
         fwrite(&magic, 4, 1, f); fwrite(&n, 4, 1, f);
         double t0 = data.empty() ? 0 : data.front().t;
         for (auto fr : data) { fr.t -= t0; fwrite(&fr, sizeof fr, 1, f); }
@@ -710,7 +755,14 @@ static void fileLoad() {
     FILE *f = fopen(p.c_str(), "rb");
     if (!f) return;
     uint32_t magic = 0, n = 0;
-    if (fread(&magic, 4, 1, f) == 1 && magic == 0x31424343 && fread(&n, 4, 1, f) == 1 && n <= MAXFRAMES * 2) {
+    if (fread(&magic, 4, 1, f) == 1 && magic == 0x31424343) {
+        fclose(f);
+        std::string old = p + ".old";
+        MoveFileExA(p.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING);
+        logf("Copycat: your old recording was made with the small eyes - saved it as %s, starting a fresh one", old.c_str());
+        return;
+    }
+    if (magic == 0x32424343 && fread(&n, 4, 1, f) == 1 && n <= MAXFRAMES * 2) {
         data.resize(n);
         if (n && fread(data.data(), sizeof(Frame), n, f) != n) data.clear();
         double base = now() - 1e6;
@@ -972,7 +1024,7 @@ static int wantTool = -1;
 std::mutex bmu;
 float bIn[8], bMem[6], bDrv[8], bOut[12];
 static float sigEnemy = 0, sigResource = 0, sigNeed = 0, sigGood = 0, sigBad = 0;
-static long decide(const uint8_t *f) {
+static long decide(const uint8_t *f, const uint8_t *th) {
     double t0 = now();
     struct Hit { int d; size_t i; };
     std::vector<Hit> top;
@@ -986,13 +1038,21 @@ static long decide(const uint8_t *f) {
         for (int s : needIdx) if (s < 32) needMask |= 1u << s;
         if (data.size() < 60) { std::lock_guard<std::mutex> l2(amu); goal = "need more recording - press F6 and play for a bit"; return -1; }
         auto cmp = [](const Hit &a, const Hit &b) { return a.d < b.d; };
+        // pass 1: tiny thumbnails, keep the 400 closest
+        std::vector<Hit> rough;
         for (size_t i = 0; i + 1 < data.size(); i++) {
             const Frame &fr = data[i];
             if (fr.self && fr.value < 0.5) continue;  // only follow my own moves if they paid off
             if (data[i + 1].t - fr.t > 0.2) continue;  // needs a continuation to follow
-            int d = dist(f, fr.f);
-            if ((int)top.size() < K) { top.push_back({d, i}); std::push_heap(top.begin(), top.end(), cmp); }
-            else if (d < top.front().d) { std::pop_heap(top.begin(), top.end(), cmp); top.back() = {d, i}; std::push_heap(top.begin(), top.end(), cmp); }
+            int d = distThumb(th, fr.thumb);
+            if (rough.size() < 400) { rough.push_back({d, i}); std::push_heap(rough.begin(), rough.end(), cmp); }
+            else if (d < rough.front().d) { std::pop_heap(rough.begin(), rough.end(), cmp); rough.back() = {d, i}; std::push_heap(rough.begin(), rough.end(), cmp); }
+        }
+        // pass 2: full sharp comparison on those
+        for (auto &rh : rough) {
+            int d = dist(f, data[rh.i].f);
+            if ((int)top.size() < K) { top.push_back({d, rh.i}); std::push_heap(top.begin(), top.end(), cmp); }
+            else if (d < top.front().d) { std::pop_heap(top.begin(), top.end(), cmp); top.back() = {d, rh.i}; std::push_heap(top.begin(), top.end(), cmp); }
         }
         if (top.empty()) return -1;
         int dmin = INT_MAX; for (auto &h : top) dmin = std::min(dmin, h.d);
@@ -1078,9 +1138,9 @@ static void loop() {
             if (mode == 2 && !takeover) { note("the game isn't in front anymore - stopped playing for safety"); logf("Copycat stopped: game window lost focus"); mode = 0; break; }
             continue;
         }
-        uint8_t f[FD]; float red;
+        alignas(16) uint8_t f[FD]; uint8_t th[TN]; float red;
         stepLoop = "capture";
-        if (!capture(f, red)) continue;
+        if (!capture(f, th, red)) continue;
         frames++;
         stepLoop = "colours";
         {
@@ -1134,7 +1194,7 @@ static void loop() {
         if (m == 2 && watching && !takeover) { takeover = true; releaseAll(); note("you took over - watching you"); }
         if (m == 2 && !watching && takeover) { takeover = false; note("back to playing on my own"); }
 
-        Frame fr{}; memcpy(fr.f, f, FD); fr.t = now();
+        Frame fr{}; memcpy(fr.f, f, FD); memcpy(fr.thumb, th, TN); fr.t = now();
         int dxr = rawDx.exchange(0), dyr = rawDy.exchange(0);
         if (watching) {
             for (int i = 0; i < 4; i++) { uint64_t b = keyBits[i]; memcpy(fr.keys + i * 8, &b, 8); }
@@ -1175,8 +1235,8 @@ static void loop() {
                 static long clipIdx = -1; static int clipLeft = 0; static size_t clipGen = 0;
                 bool repick = clipLeft <= 0 || clipIdx < 0 || clipGen != eraseGen;
                 if (!repick) { std::lock_guard<std::mutex> lk(mu); repick = clipIdx >= (long)data.size() || dist(f, data[clipIdx].f) > dRef * 2.6; }
-                if (repick || frames % 10 == 0) {
-                    long p = decide(f);
+                if (repick || frames % 30 == 0) {
+                    long p = decide(f, th);
                     if (repick) { clipIdx = p; clipLeft = 24; clipGen = eraseGen; }
                 }
                 std::string act;
@@ -1297,7 +1357,7 @@ static void loop() {
             }
         }
         if (now() - lastAnalyze > 2) { stepLoop = "analyze"; analyze(); lastAnalyze = now(); }
-        if (now() - lastSave > 120) { stepLoop = "save"; fileSave(); lastSave = now(); }
+        if (now() - lastSave > 600) { stepLoop = "save"; fileSave(); lastSave = now(); }
         stepLoop = "wait";
     }
     releaseAll();

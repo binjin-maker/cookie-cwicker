@@ -575,8 +575,10 @@ CONTENTS
   often captures black - use borderless windowed).
 
   F6 (or "Watch me play")  click the game, press F6, play normally.
-      It records the game window 30 times a second (tiny 32x18 snapshot
-      + colour), every key you hold, mouse buttons and raw mouse
+      It records the game window 30 times a second (a 64x36 view +
+      colour + a sharp 24x24 close-up of the crosshair area taken from
+      the full-resolution screen, so it can tell what's under your
+      aim), every key you hold, mouse buttons and raw mouse
       movement (works with locked FPS cursors). F6 again stops & saves.
   F7 (or "Let it play")    it plays: it finds the remembered moment
       that looks most like the screen (favouring moments that turned
@@ -692,5 +694,7 @@ CONTENTS
 
   Files (in copycat\ next to the exe, one set per game exe name):
      <game>.rec            everything it recorded + places + answers
+                           (recordings from before v22 used smaller eyes
+                           and are kept as <game>.rec.old)
      <game>_journal.txt    readable notes, events and findings
   Code: copycat.h.
