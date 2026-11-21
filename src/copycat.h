@@ -40,6 +40,7 @@ struct KeyStat { int held = 0; double change = 0, sx = 0, sy = 0; int good = 0, 
 struct Plan { std::vector<WORD> keys; int btn = 0; float mdx = 0; double until = 0; bool show = false; std::string text; };
 struct Memory { uint8_t f[FD]; std::string text; };
 
+std::atomic<const char *> stepLoop{"-"}, stepOcr{"-"}, stepHud{"-"};
 std::atomic<int> mode{0};  // 0 off, 1 watching, 2 copying, 3 asking
 std::atomic<bool> takeover{false};
 HWND tgt = nullptr;
@@ -297,14 +298,18 @@ static void reward(float r, int statIdx, bool up, const char *why) {
 }
 
 static void ocrThread() {
+    RoInitialize(RO_INIT_MULTITHREADED);
     while (!gQuit) {
+        stepOcr = "idle";
         Sleep(120);
         if (!mode || mode == 3 || GetForegroundWindow() != tgt) continue;
         Rect r; if (!targetRect(r)) continue;
         double t0 = now();
         double sc = std::min(1.0, 1800.0 / std::max(1, r.x1 - r.x0));
+        stepOcr = "reading the screen";
         auto words = ocrRect(r, sc);
         ocrMs = (now() - t0) * 1000;
+        stepOcr = "parsing numbers";
         struct Pend { float r; int idx; bool up; std::string why; };
         std::vector<Pend> pend;
         std::string watch;
@@ -360,6 +365,7 @@ static void ocrThread() {
         }
         for (auto &s : stats) if (s.seen > 2 && s.weight != 0) watch += s.label + " " + fmtNum(s.last) + "  ";
         statLock.unlock();
+        stepOcr = "giving rewards";
         for (auto &p : pend) reward(p.r, p.idx, p.up, p.why.c_str());
         std::lock_guard<std::mutex> lk(amu);
         watchTxt = watch.empty() ? "no numbers on screen yet" : watch;
@@ -623,20 +629,25 @@ static void loop() {
         if (!IsWindow(tgt)) { note("the game window closed - stopping"); mode = 0; break; }
         if (GetForegroundWindow() != tgt) { releaseAll(); continue; }
         uint8_t f[FD]; float red;
+        stepLoop = "capture";
         if (!capture(f, red)) continue;
         frames++;
+        stepLoop = "colours";
         {
             std::lock_guard<std::mutex> lk(amu);
             for (int c = 0; c < 3; c++) { double s = 0; for (int i = 0; i < 8; i++) s += f[FG + i * 3 + c]; allColor[c] += s / 8; }
             allColorN++;
         }
-        if (havePrev && red - redAvg > 18) reward(-1.5f, -1, false, "screen flashed red (damage?)");
+        if (!havePrev) redAvg = red;
+        else if (red - redAvg > 18) { stepLoop = "red flash reward"; reward(-1.5f, -1, false, "screen flashed red (damage?)"); }
         redAvg = redAvg * 0.95f + red * 0.05f;
+        stepLoop = "motion";
         int sx = 0, sy = 0; double change = 0;
         if (havePrev) shiftOf(prev, f, sx, sy, change);
         memcpy(prev, f, FD); havePrev = true;
 
         int m = mode;
+        stepLoop = "mode";
         if (m == 3) {
             std::string a;
             { std::lock_guard<std::mutex> lk(amu); if (!answers.empty()) { a = answers.front(); answers.pop_front(); } }
@@ -670,6 +681,7 @@ static void loop() {
                 b = plan.btn; mx = (int)plan.mdx; my = 0;
                 std::lock_guard<std::mutex> lk(amu); goal = "doing what you said: \"" + plan.text + "\""; actionTxt = "following your answer";
             } else {
+                stepLoop = "decide";
                 decide(f, ko, b, mx, my);
                 if (confusion > 2.2) {
                     if (confusedSince == 0) confusedSince = now();
@@ -684,13 +696,17 @@ static void loop() {
                     }
                 } else confusedSince = 0;
             }
+            stepLoop = "press keys";
             applyOut(ko, b);
             sendMove(mx, my);
             memcpy(fr.keys, ko, 32); fr.btn = (uint8_t)b; fr.dx = (int16_t)mx; fr.dy = (int16_t)my; fr.self = 1;
         }
+        stepLoop = "store frame";
         {
             std::lock_guard<std::mutex> lk(mu);
+            stepLoop = "place";
             fr.place = (uint16_t)std::max(0, placeFor(f));
+            stepLoop = "key stats";
             data.push_back(fr);
             if (fr.self) selfN++; else demoN++;
             if (data.size() > MAXFRAMES) {
@@ -722,8 +738,9 @@ static void loop() {
             placeTxt = "Place " + std::to_string(fr.place + 1) + " (" + places[fr.place].look + ")";
             if (watching) { actionTxt = "recording you"; if (m == 1) goal = "learning what you do"; }
         }
-        if (now() - lastAnalyze > 2) { analyze(); lastAnalyze = now(); }
-        if (now() - lastSave > 120) { fileSave(); lastSave = now(); }
+        if (now() - lastAnalyze > 2) { stepLoop = "analyze"; analyze(); lastAnalyze = now(); }
+        if (now() - lastSave > 120) { stepLoop = "save"; fileSave(); lastSave = now(); }
+        stepLoop = "wait";
     }
     releaseAll();
 }
@@ -770,6 +787,7 @@ void start(int m) {
 
 // ---------- analysis HUD ----------
 void renderHud() {
+    stepHud = "drawing";
     double k = 1.0;
     if (tgt) { UINT d = GetDpiForWindow(tgt); if (d) k = d / 96.0 * 0.9; }
     int W = (int)(560 * k), H = (int)(520 * k);
@@ -863,6 +881,7 @@ void renderHud() {
     int hx = wa.left + (gHudDX >= 0 ? gHudDX : (int)(26 * k)), hy = wa.bottom - H - (gHudDY >= 0 ? gHudDY : (int)(26 * k));
     hx = std::max((int)wa.left, std::min((int)wa.right - W, hx)); hy = std::max((int)wa.top, std::min((int)wa.bottom - H, hy));
     pushLayered(gHudWnd, hx, hy, W, H, bg.data(), gHudDrag);
+    stepHud = "done";
 }
 bool hudWanted() { return mode && tgt && GetForegroundWindow() == tgt; }
 

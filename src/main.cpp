@@ -32,7 +32,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 14;
+static const int VERSION = 15;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -60,6 +60,7 @@ static void updateGoalHud();
 namespace cc {
 void onKey(DWORD vk, bool down); void onPhys(); bool asking(); HWND target(); void answer(const std::string &s); bool active();
 void start(int m); void stop(); void renderHud(); bool hudWanted(); void init();
+extern std::atomic<const char *> stepLoop, stepOcr, stepHud;
 }
 static void processCmds();
 
@@ -2134,8 +2135,8 @@ static LONG WINAPI crashLog(EXCEPTION_POINTERS *e) {
     if (FILE *f = fopen("cookiebot_crash.txt", "a")) {
         time_t t = time(nullptr); char ts[32]; strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", localtime(&t));
         uintptr_t addr = (uintptr_t)e->ExceptionRecord->ExceptionAddress, base = (uintptr_t)GetModuleHandleW(nullptr);
-        fprintf(f, "[%s] v%d crash code %08lX at exe+0x%llX (thread %lu, copycat %s)\n", ts, VERSION, e->ExceptionRecord->ExceptionCode,
-                (unsigned long long)(addr - base), GetCurrentThreadId(), cc::active() ? "on" : "off");
+        fprintf(f, "[%s] v%d crash code %08lX at exe+0x%llX (thread %lu, copycat %s) loop:%s ocr:%s hud:%s\n", ts, VERSION, e->ExceptionRecord->ExceptionCode,
+                (unsigned long long)(addr - base), GetCurrentThreadId(), cc::active() ? "on" : "off", cc::stepLoop.load(), cc::stepOcr.load(), cc::stepHud.load());
         fclose(f);
     }
     if (gLog) { fprintf(gLog, "CRASHED - details in cookiebot_crash.txt\n"); fflush(gLog); }
@@ -2145,7 +2146,10 @@ static LONG WINAPI crashLog(EXCEPTION_POINTERS *e) {
 int main(int argc, char **argv) {
     SetUnhandledExceptionFilter(crashLog);
     std::set_terminate([] {
-        if (FILE *f = fopen("cookiebot_crash.txt", "a")) { fprintf(f, "v%d std::terminate (thread misuse / uncaught exception)\n", VERSION); fclose(f); }
+        if (FILE *f = fopen("cookiebot_crash.txt", "a")) {
+            fprintf(f, "v%d std::terminate (uncaught exception) loop:%s ocr:%s hud:%s\n", VERSION, cc::stepLoop.load(), cc::stepOcr.load(), cc::stepHud.load());
+            fclose(f);
+        }
         abort();
     });
     for (int i = 1; i < argc; i++) {
