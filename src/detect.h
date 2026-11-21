@@ -12,7 +12,7 @@ static const char *COCO[80] = {"person", "bicycle", "car", "motorcycle", "airpla
                                "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors",
                                "teddy bear", "hair drier", "toothbrush"};
 
-struct Box { int x0, y0, x1, y1; int cls; float conf; };
+struct Box { int x0, y0, x1, y1; int cls; float conf; bool own = false; };
 
 // ---- minimal ONNX Runtime C API, loaded at runtime (OrtApi is a stable table of function pointers) ----
 typedef void *Status;
@@ -223,7 +223,7 @@ static void draw(const Rect &r, const std::vector<Box> &bs, const std::vector<st
     SetBkMode(dc, OPAQUE);
     for (size_t i = 0; i < bs.size(); i++) {
         const Box &b = bs[i];
-        uint32_t col = kind[i] < 0 ? 0xFFFF3030 : kind[i] > 0 ? 0xFF40E070 : 0xFFFFD040;
+        uint32_t col = kind[i] == 2 ? 0xFF8A93A0 : kind[i] < 0 ? 0xFFFF3030 : kind[i] > 0 ? 0xFF40E070 : 0xFFFFD040;
         int x0 = b.x0 - r.x0, y0 = b.y0 - r.y0, x1 = b.x1 - r.x0, y1 = b.y1 - r.y0;
         for (int t = 0; t < 3; t++) {
             for (int x = x0; x <= x1; x++) { put(x, y0 + t, col); put(x, y1 - t, col); }

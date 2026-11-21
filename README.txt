@@ -593,8 +593,17 @@ CONTENTS
       "red ones are enemies" / "green ones are friendly"
                                         -> colour of moving things
       "3 is the hatchet"                -> names hotbar slot 3
-      "bears are dangerous" / "people are enemies" / "cows are food"
-                                        -> what detected things are
+      "bears are dangerous" / "person is enemy" / "cows are food"
+                                        -> what detected things are; what
+                                           you say always beats what it
+                                           worked out itself
+      "airplane is my gun" / "that's my gun"
+                                        -> the detector has no "gun" class
+                                           and may call your gun something
+                                           odd; this marks it as YOURS (grey
+                                           box) so it never counts as good
+                                           or bad, and renames it
+      "airplanes are guns"              -> just renames a class
       "that's a tree" / "looking at a rock" -> names what's in the middle
       or an action ("run forward", "shoot", "turn around").
       Rules/names are saved in copycat\<game>.rules.

@@ -353,6 +353,16 @@ static void findMovers(const uint32_t *a, const uint32_t *b, int sx, int sy) {
         m.r = (int)(rr / m.n); m.g = (int)(gg / m.n); m.b = (int)(bb / m.n);
         movers.push_back(m);
     }
+    static float movePres[48];
+    for (auto &v : movePres) v *= 0.98f;
+    std::vector<Mover> kept;
+    for (auto &m : movers) {
+        int cell = std::min(5, m.y * 6 / MH) * 8 + std::min(7, m.x * 8 / MW);
+        movePres[cell] = std::min(1.f, movePres[cell] + 0.02f);
+        if (movePres[cell] > 0.6f && m.y > MH / 2) continue;  // always moving down there = your own gun/arms
+        kept.push_back(m);
+    }
+    movers.swap(kept);
     std::sort(movers.begin(), movers.end(), [](const Mover &p, const Mover &q) { return p.n > q.n; });
     if (movers.size() > 6) movers.resize(6);
     double t = now();
@@ -408,8 +418,26 @@ static int recognizeLook() {
 static int classGood[80], classBad[80];
 static double classSeen[80];
 static bool firstSeenNoted[80];
-static bool hostileClass(int c) { return classBad[c] >= 3 && classBad[c] > classGood[c] * 2; }
-static bool friendlyClass(int c) { return classGood[c] >= 3 && classGood[c] > classBad[c] * 2; }
+// what you told it beats what it worked out: -1 enemy, 1 friendly, 2 yours (your own gun/arms/HUD)
+static int userClass[80];
+static std::string classAlias[80];
+static bool hostileClass(int c) { return userClass[c] == -1 || (userClass[c] == 0 && classBad[c] >= 3 && classBad[c] > classGood[c] * 2); }
+static bool friendlyClass(int c) { return userClass[c] == 1 || (userClass[c] == 0 && classGood[c] >= 3 && classGood[c] > classBad[c] * 2); }
+static std::string className(int c) { return classAlias[c].empty() ? det::COCO[c] : classAlias[c]; }
+// things that sit in the same spot at the bottom of the screen most of the time (your gun / arms) are yours, not enemies
+static float presence[80][48];
+static void markOwn(std::vector<det::Box> &bs, const Rect &r) {
+    int W = std::max(1, r.x1 - r.x0), H = std::max(1, r.y1 - r.y0);
+    for (auto &row : presence) for (auto &v : row) v *= 0.985f;
+    for (auto &b : bs) {
+        int cx = ((b.x0 + b.x1) / 2 - r.x0) * 8 / W, cy = ((b.y0 + b.y1) / 2 - r.y0) * 6 / H;
+        int cell = std::max(0, std::min(5, cy)) * 8 + std::max(0, std::min(7, cx));
+        float &p = presence[b.cls][cell];
+        p = std::min(1.f, p + 0.015f);
+        bool bottom = b.y1 > r.y0 + H * 0.85;
+        b.own = userClass[b.cls] == 2 || (bottom && p > 0.5f);
+    }
+}
 static double lastHitAt = 0;
 
 static std::string toolName(int i) { return i <= 0 ? "nothing known" : !tools[i].name.empty() ? tools[i].name : "slot " + std::to_string(i); }
@@ -612,16 +640,22 @@ static void detThread() {
         int cxs = (r.x0 + r.x1) / 2, cys = (r.y0 + r.y1) / 2;
         {
             std::lock_guard<std::mutex> lk(mu);
+            markOwn(bs, r);
             for (auto &b : bs) {
+                if (b.own) {
+                    labels.push_back(" " + className(b.cls) + " (yours) "); kind.push_back(2);
+                    continue;
+                }
                 classSeen[b.cls] = t;
-                if (!firstSeenNoted[b.cls]) { firstSeenNoted[b.cls] = true; note("first time seeing a %s", det::COCO[b.cls]); }
+                if (!firstSeenNoted[b.cls]) { firstSeenNoted[b.cls] = true; note("first time seeing a %s", className(b.cls).c_str()); }
                 int k = hostileClass(b.cls) ? -1 : friendlyClass(b.cls) ? 1 : 0;
-                char l[64]; snprintf(l, sizeof l, " %s %d%%%s ", det::COCO[b.cls], (int)(b.conf * 100), k < 0 ? " ENEMY?" : "");
+                char l[96];
+                snprintf(l, sizeof l, " %s %d%%%s ", className(b.cls).c_str(), (int)(b.conf * 100), k < 0 ? (userClass[b.cls] == -1 ? " ENEMY" : " ENEMY?") : k > 0 ? " friendly" : "");
                 labels.push_back(l); kind.push_back(k);
                 if (txt.size() < 90) {
                     int bx = (b.x0 + b.x1) / 2;
                     bool mid = cxs > b.x0 && cxs < b.x1 && cys > b.y0 && cys < b.y1;
-                    txt += std::string(txt.empty() ? "" : ", ") + det::COCO[b.cls] + (mid ? " (ahead)" : bx < cxs ? " (left)" : " (right)") + (k < 0 ? " [enemy?]" : "");
+                    txt += std::string(txt.empty() ? "" : ", ") + className(b.cls) + (mid ? " (ahead)" : bx < cxs ? " (left)" : " (right)") + (k < 0 ? " [ENEMY]" : "");
                 }
             }
         }
@@ -672,8 +706,11 @@ static void analyze() {
         if (bd > 8) { char b[120]; snprintf(b, sizeof b, "danger: screens get more %s right before bad stuff", nm[bi]); out.push_back(b); }
     }
     for (int c = 0; c < 80 && out.size() < 10; c++) {
-        if (hostileClass(c)) out.push_back(std::string(det::COCO[c]) + "s show up before bad stuff - probably enemies (" + std::to_string(classBad[c]) + "x)");
-        else if (friendlyClass(c)) out.push_back(std::string(det::COCO[c]) + "s come with good stuff");
+        if (userClass[c] == 2) continue;
+        if (userClass[c] == -1) out.push_back(className(c) + "s are enemies (you said so)");
+        else if (userClass[c] == 1) out.push_back(className(c) + "s are friendly (you said so)");
+        else if (hostileClass(c)) out.push_back(className(c) + "s show up before bad stuff - probably enemies (" + std::to_string(classBad[c]) + "x)");
+        else if (friendlyClass(c)) out.push_back(className(c) + "s come with good stuff");
     }
     for (size_t i = 0; i < looks.size() && out.size() < 10; i++) if (looks[i].n >= 3 && looks[i].label.rfind("gives ", 0) == 0) out.push_back("learned what things that " + looks[i].label + " look like (" + std::to_string(looks[i].n) + " hits)");
     for (int bin = 0; bin < 24 && out.size() < 10; bin++) {
@@ -845,6 +882,8 @@ static void saveRules() {
         for (int i = 1; i <= 9; i++) if (!tools[i].name.empty()) fprintf(f, "toolname %d %s\n", i, tools[i].name.c_str());
         for (int b = 0; b < 24; b++) if (moverGood[b] || moverBad[b]) fprintf(f, "mover %d %d %d\n", b, moverGood[b], moverBad[b]);
         for (int c = 0; c < 80; c++) if (classGood[c] || classBad[c]) fprintf(f, "class %d %d %d\n", c, classGood[c], classBad[c]);
+        for (int c = 0; c < 80; c++) if (userClass[c]) fprintf(f, "userclass %d %d\n", c, userClass[c]);
+        for (int c = 0; c < 80; c++) if (!classAlias[c].empty()) fprintf(f, "alias %d %s\n", c, classAlias[c].c_str());
         fclose(f);
     }
     p = "copycat\\" + name + ".looks";
@@ -865,6 +904,7 @@ static void loadRules() {
     memset(banned, 0, sizeof banned); bannedBtn = 0;
     memset(moverGood, 0, sizeof moverGood); memset(moverBad, 0, sizeof moverBad);
     memset(classGood, 0, sizeof classGood); memset(classBad, 0, sizeof classBad);
+    memset(userClass, 0, sizeof userClass); for (auto &a : classAlias) a.clear();
     looks.clear();
     {
         std::string lp = "copycat\\" + name + ".looks";
@@ -902,6 +942,8 @@ static void loadRules() {
             int g2, b2;
             if (sscanf(line, "mover %d %d %d", &v, &g2, &b2) == 3 && v >= 0 && v < 24) { moverGood[v] = g2; moverBad[v] = b2; }
             else if (sscanf(line, "class %d %d %d", &v, &g2, &b2) == 3 && v >= 0 && v < 80) { classGood[v] = g2; classBad[v] = b2; }
+            else if (sscanf(line, "userclass %d %d", &v, &g2) == 2 && v >= 0 && v < 80) userClass[v] = g2;
+            else if (sscanf(line, "alias %d %259[^\n]", &v, nm) == 2 && v >= 0 && v < 80) classAlias[v] = nm;
         }
     }
     fclose(f);
@@ -967,10 +1009,55 @@ static bool explain(const std::string &raw, int place) {
             for (auto &c : cw)
                 if ((" " + t).find(std::string(" ") + c[0]) != std::string::npos) {
                     int k = atoi(c[1]);
+                    userClass[k] = enemy ? -1 : 1;
                     if (enemy) classBad[k] += 10; else classGood[k] += 10;
-                    note("%ss are %s", det::COCO[k], enemy ? "ENEMIES" : "good / friendly");
+                    note("%ss are %s (your call - it'll stick)", det::COCO[k], enemy ? "ENEMIES" : "good / friendly");
                     did = true; break;
                 }
+    }
+    // "that's my gun" / "airplane is my gun" / "airplanes are guns"
+    {
+        bool mineWord = t.find("my gun") != std::string::npos || t.find("my weapon") != std::string::npos || t.find("my rifle") != std::string::npos ||
+                        t.find("my pistol") != std::string::npos || t.find("my arm") != std::string::npos || t.find("my hand") != std::string::npos ||
+                        t.find("my tool") != std::string::npos || t.find("s mine") != std::string::npos || t.find("is mine") != std::string::npos ||
+                        t.find("my own") != std::string::npos || t.find("its me") != std::string::npos || t.find("that s me") != std::string::npos;
+        int named = -1;
+        for (int c = 0; c < 80; c++) {
+            std::string n = det::COCO[c];
+            if ((" " + t + " ").find(" " + n + " ") != std::string::npos || (" " + t + " ").find(" " + n + "s ") != std::string::npos) { named = c; break; }
+        }
+        std::string aliasTo;
+        for (const char *ph : {" are ", " is a ", " is an ", " is my ", " is "}) {
+            size_t k = t.find(ph);
+            if (named >= 0 && k != std::string::npos) {
+                aliasTo = t.substr(k + strlen(ph));
+                for (const char *dropw : {"my ", "a ", "an ", "the "}) if (aliasTo.rfind(dropw, 0) == 0) aliasTo = aliasTo.substr(strlen(dropw));
+                while (!aliasTo.empty() && aliasTo.back() == ' ') aliasTo.pop_back();
+                if (!aliasTo.empty() && aliasTo.back() == 's' && aliasTo.size() > 3) aliasTo.pop_back();
+                break;
+            }
+        }
+        bool gunish = aliasTo.find("gun") != std::string::npos || aliasTo.find("weapon") != std::string::npos || aliasTo.find("rifle") != std::string::npos ||
+                      aliasTo.find("pistol") != std::string::npos || aliasTo.find("arm") != std::string::npos || aliasTo.find("hand") != std::string::npos ||
+                      aliasTo.find("tool") != std::string::npos;
+        if (named >= 0 && (mineWord || gunish)) {
+            userClass[named] = 2; classBad[named] = classGood[named] = 0;
+            if (!aliasTo.empty()) classAlias[named] = aliasTo;
+            note("%s = %s, it's yours - won't count it as good or bad", det::COCO[named], className(named).c_str());
+            did = true;
+        } else if (mineWord && named < 0) {
+            std::lock_guard<std::mutex> dl(det::mu);
+            Rect r; std::string what;
+            if (targetRect(r))
+                for (auto &b : det::boxes)
+                    if (b.y1 > r.y0 + (r.y1 - r.y0) * 0.6) { userClass[b.cls] = 2; classBad[b.cls] = classGood[b.cls] = 0; what += std::string(what.empty() ? "" : ", ") + det::COCO[b.cls]; }
+            note(what.empty() ? "couldn't see what you mean - try \"airplane is my gun\"" : "marked as yours: %s", what.c_str());
+            did = true;
+        } else if (named >= 0 && !aliasTo.empty() && !did) {
+            static const char *skipw[] = {"enem", "hostile", "danger", "friend", "safe", "good", "bad", "food"};
+            bool plain = true; for (auto w : skipw) if (aliasTo.find(w) != std::string::npos) plain = false;
+            if (plain) { classAlias[named] = aliasTo; note("calling %ss \"%s\" from now on", det::COCO[named], aliasTo.c_str()); did = true; }
+        }
     }
     for (const char *ph : {"that s a ", "that s an ", "thats a ", "thats an ", "that is a ", "that is an ", "looking at a ", "looking at an ", "looking at "}) {
         size_t k = t.find(ph);
@@ -1067,7 +1154,7 @@ static long decide(const uint8_t *f, const uint8_t *th) {
             if (now() - det::boxesAt < 0.5 && targetRect(r)) {
                 int cx = (r.x0 + r.x1) / 2, cy = (r.y0 + r.y1) / 2, mx = (r.x1 - r.x0) / 4, my = (r.y1 - r.y0) / 4;
                 for (auto &b : det::boxes)
-                    if (hostileClass(b.cls) && b.x1 > cx - mx && b.x0 < cx + mx && b.y1 > cy - my && b.y0 < cy + my) enemyNear = true;
+                    if (!b.own && hostileClass(b.cls) && b.x1 > cx - mx && b.x0 < cx + mx && b.y1 > cy - my && b.y0 < cy + my) enemyNear = true;
             }
         }
         bool resourceAhead = lookingAt >= 0 && looks[lookingAt].stat >= 0 && needMask && (needMask & (1u << looks[lookingAt].stat));
