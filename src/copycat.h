@@ -1217,7 +1217,7 @@ static void camStep(int &mx, int &my) {
 // ---------- taught tasks: you show it something, name it, say when to do it ----------
 struct Step { uint8_t keys[32]; uint8_t btn; int16_t dx, dy; };
 // a step of an explained approach: "look at the cow then walk until close then hit 3 times"
-struct Cmd { int type = 0; int vk = 0, btn = 0, cls = -1, times = 0; double secs = 1, px = 0, py = 0; bool sprint = false; std::string task; };
+struct Cmd { int type = 0; int vk = 0, btn = 0, cls = -1, times = 0; double secs = 1, px = 0, py = 0; bool sprint = false; std::string task; std::vector<int> extra; };
 enum { C_LOOK = 1, C_TURN, C_MOVE, C_UNTIL, C_CLICK, C_TAP, C_WAIT, C_HOLD, C_RUN };
 struct Task {
     std::string name, when, script;
@@ -1266,13 +1266,26 @@ static std::vector<Cmd> parseScript(const std::string &raw, int defCls = -1) {
             if (p.find(" " + a) != std::string::npos || p.find(" " + b) != std::string::npos) { cls = k; break; }
         }
         if (has(" hold ")) {
-            size_t q = p.find(" hold ") + 6; std::string w = p.substr(q); w = w.substr(0, w.find(' '));
+            // everything named between "hold" and "for" is held together: "hold rmb && lmb for 300ms", "hold w and shift for 2s"
+            std::string body = p.substr(p.find(" hold ") + 6);
+            size_t fo = body.find(" for "); if (fo != std::string::npos) body = body.substr(0, fo);
             Cmd h; h.type = C_HOLD; h.secs = n > 0 ? n : 1;
-            if (w == "the") { std::string r2 = p.substr(q + 4); w = r2.substr(0, r2.find(' ')); }
-            if (w == "right" || has(" right click") || has(" rmb") || has(" right mouse") || w == "aim" || w == "m2" || w == "mouse2") h.btn = 2;
-            else if (w == "click" || w == "left" || w == "lmb" || w == "mouse" || w == "fire" || w == "shoot" || w == "attack") h.btn = 1;
-            else { int vk = vkFromWord(w); if (vk > 0 && vk < 256) h.vk = vk; else if (vk == 1001) h.btn = 1; else if (vk == 1002) h.btn = 2; }
-            if (h.btn || h.vk) { out.push_back(h); continue; }
+            auto toks = split(body);
+            for (size_t i = 0; i < toks.size(); i++) {
+                const std::string &w = toks[i];
+                bool nextClick = i + 1 < toks.size() && (toks[i + 1] == "click" || toks[i + 1] == "mouse");
+                if (w == "rmb" || w == "m2" || w == "mouse2" || w == "aim" || (w == "right" && nextClick)) { h.btn |= 2; if (w == "right") i++; }
+                else if (w == "lmb" || w == "m1" || w == "mouse1" || w == "fire" || w == "shoot" || w == "attack" || (w == "left" && nextClick)) { h.btn |= 1; if (w == "left") i++; }
+                else if (w == "click" || w == "mouse") h.btn |= 1;
+                else if (w == "mmb" || w == "middle") h.btn |= 4;
+                else if (w == "and" || w == "the" || w == "both") continue;
+                else {
+                    int vk = vkFromWord(w);
+                    if (vk > 0 && vk < 256 && h.extra.size() < 6) h.extra.push_back(vk);
+                }
+            }
+            if (!h.extra.empty()) h.vk = h.extra[0];
+            if (h.btn || !h.extra.empty()) { out.push_back(h); continue; }
         }
         if (cls < 0 && (has(" it ") || has(" them ") || has(" that ") || has(" one "))) cls = defCls;
         if ((has(" look at") || has(" face ") || has(" aim at") || has(" point at")) && cls >= 0) {
@@ -1896,7 +1909,11 @@ static void loop() {
                         if (c.times > 0) { double ph = std::fmod(el, 0.35); b = ph < 0.18 ? c.btn : 0; if (el > c.times * 0.35) done = true; }
                         else { b = c.btn; if (el > std::max(0.17, c.secs)) done = true; }
                         what = "hit"; break;
-                    case C_HOLD: if (c.btn) b = c.btn; else ko[c.vk >> 3] |= 1 << (c.vk & 7); done = el > c.secs; what = "hold"; break;
+                    case C_HOLD:
+                        b = c.btn;
+                        if (c.extra.empty() && c.vk) ko[c.vk >> 3] |= 1 << (c.vk & 7);
+                        for (int vk : c.extra) ko[vk >> 3] |= 1 << (vk & 7);
+                        done = el > std::max(0.17, c.secs); what = "hold"; break;
                     case C_TAP: { double ph = std::fmod(el, 0.3); if (ph < 0.12) ko[c.vk >> 3] |= 1 << (c.vk & 7); if (el > c.times * 0.3) done = true; what = "press " + keyName(c.vk); break; }
                     case C_WAIT: done = el > c.secs; what = "wait"; break;
                     case C_RUN: {

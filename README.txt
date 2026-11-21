@@ -724,6 +724,7 @@ CONTENTS
       click / click lmb / click rmb / right click   (one click)
       click x3 / click rmb 3 times / hit for 2 seconds
       hold lmb for 500ms / hold rmb for 2s / hold w for 1.5 seconds
+      hold rmb && lmb for 300ms / hold w and shift for 2s  (together)
       aim/crouch [N seconds]
       press <key> [N times], use/loot/eat (E), jump, reload, wait N
       do <other task>
