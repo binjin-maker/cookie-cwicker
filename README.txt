@@ -604,6 +604,8 @@ CONTENTS
                                            box) so it never counts as good
                                            or bad, and renames it
       "airplanes are guns"              -> just renames a class
+      "wet doesn't matter" / "ignore wet" -> that number is ignored
+      "radiation is bad" / "scrap is good" -> which way is good for it
       "that's a tree" / "looking at a rock" -> names what's in the middle
       or an action ("run forward", "shoot", "turn around").
       Rules/names are saved in copycat\<game>.rules.
@@ -628,8 +630,11 @@ CONTENTS
   finds the label next to each one. Health/armor/food/water/stamina
   going up = good, down = bad; score/kills/coins/wood/stone/metal/
   scrap/loot up = good; radiation/cold/poison up = bad; ammo, time,
-  fps and coordinates are ignored; numbers that tick constantly
-  (clocks) are ignored. A sudden red flash of the screen = bad.
+  fps, coordinates, wet/temperature/comfort/weight are ignored;
+  numbers that tick constantly (clocks) are ignored. A number that
+  keeps going up while nothing is being pressed (it rises by itself)
+  is switched off automatically, so it never learns that sitting
+  still is good. A sudden red flash of the screen = bad.
 
   Needs: if health/food/water/etc. gets low or keeps dropping, it
   favours moments that raised that stat before ("trying to get").

@@ -25,7 +25,7 @@ struct Stat {
     std::string label;
     int bx = 0, by = 0;
     double last = 0, maxSeen = 0, lastT = 0, trend = 0;
-    int seen = 0, changes = 0, samples = 0;
+    int seen = 0, changes = 0, samples = 0, passiveUps = 0, activeUps = 0;
     float weight = 1;
     bool need = false;
 };
@@ -501,8 +501,12 @@ static int placeFor(const uint8_t *f) {
 }
 
 // ---------- rewards from numbers on screen ----------
+static std::map<std::string, float> statOverride;  // what you told it a number is worth (0 = ignore)
 static float weightFor(const std::string &l, bool &needLike) {
     needLike = false;
+    auto ov = statOverride.find(l);
+    if (ov != statOverride.end()) return ov->second;
+    for (const char *w : {"wet", "comfort", "temperature", "temp", "weight", "fps", "ping"}) if (l.find(w) != std::string::npos) return 0;
     for (const char *w : {"health", "hp", "life", "lives", "shield", "armor", "armour"}) if (l.find(w) != std::string::npos) { needLike = true; return 3; }
     for (const char *w : {"food", "hunger", "water", "thirst", "stamina", "energy", "calories", "hydration"}) if (l.find(w) != std::string::npos) { needLike = true; return 2; }
     for (const char *w : {"radiation", "rad", "cold", "heat", "poison", "bleed", "wanted"}) if (l.find(w) != std::string::npos) return -2;
@@ -597,8 +601,28 @@ static void ocrThread() {
                 double d = v - s.last;
                 if (std::fabs(d) > std::max(1.0, std::fabs(s.last)) * 50) { s.last = v; continue; }  // misread
                 s.trend = s.trend * 0.7 + (d > 0 ? 1 : -1) * 0.3;
+                bool idleNow = false;
+                {
+                    // was anything pressed / moved in the last 2 s?
+                    int act = 0, n = 0; double tn = now();
+                    for (int i = (int)data.size() - 1; i >= 0 && tn - data[i].t < 2.0; i--, n++) {
+                        bool any = data[i].btn || std::abs(data[i].dx) + std::abs(data[i].dy) > 2;
+                        for (int b = 0; b < 32 && !any; b++) if (data[i].keys[b]) any = true;
+                        if (any) act++;
+                    }
+                    idleNow = n > 10 && act < n / 10;
+                }
+                if (!clock && s.weight > 0 && d > 0) {
+                    if (idleNow) s.passiveUps++; else s.activeUps++;
+                    if (s.passiveUps >= 5 && s.passiveUps > s.activeUps * 2) {
+                        s.weight = 0;
+                        statOverride[s.label] = 0;
+                        note("%s goes up by itself while nothing's happening - ignoring it from now on", s.label.c_str());
+                    }
+                }
                 if (!clock && s.weight != 0 && s.seen > 2) {
                     float r2 = (d > 0 ? 1.f : -1.f) * s.weight;
+                    if (idleNow && r2 > 0) r2 *= 0.2f;  // don't learn "sit still = good"
                     char why[128]; snprintf(why, sizeof why, "%s %s -> %s", s.label.c_str(), fmtNum(s.last).c_str(), fmtNum(v).c_str());
                     pend.push_back({r2, idx, d > 0, why});
                 }
@@ -883,6 +907,7 @@ static void saveRules() {
         for (int b = 0; b < 24; b++) if (moverGood[b] || moverBad[b]) fprintf(f, "mover %d %d %d\n", b, moverGood[b], moverBad[b]);
         for (int c = 0; c < 80; c++) if (classGood[c] || classBad[c]) fprintf(f, "class %d %d %d\n", c, classGood[c], classBad[c]);
         for (int c = 0; c < 80; c++) if (userClass[c]) fprintf(f, "userclass %d %d\n", c, userClass[c]);
+        for (auto &kv : statOverride) fprintf(f, "statweight %g %s\n", kv.second, kv.first.c_str());
         for (int c = 0; c < 80; c++) if (!classAlias[c].empty()) fprintf(f, "alias %d %s\n", c, classAlias[c].c_str());
         fclose(f);
     }
@@ -905,6 +930,7 @@ static void loadRules() {
     memset(moverGood, 0, sizeof moverGood); memset(moverBad, 0, sizeof moverBad);
     memset(classGood, 0, sizeof classGood); memset(classBad, 0, sizeof classBad);
     memset(userClass, 0, sizeof userClass); for (auto &a : classAlias) a.clear();
+    statOverride.clear();
     looks.clear();
     {
         std::string lp = "copycat\\" + name + ".looks";
@@ -944,6 +970,7 @@ static void loadRules() {
             else if (sscanf(line, "class %d %d %d", &v, &g2, &b2) == 3 && v >= 0 && v < 80) { classGood[v] = g2; classBad[v] = b2; }
             else if (sscanf(line, "userclass %d %d", &v, &g2) == 2 && v >= 0 && v < 80) userClass[v] = g2;
             else if (sscanf(line, "alias %d %259[^\n]", &v, nm) == 2 && v >= 0 && v < 80) classAlias[v] = nm;
+            else { float wv; if (sscanf(line, "statweight %f %259[^\n]", &wv, nm) == 2) statOverride[nm] = wv; }
         }
     }
     fclose(f);
@@ -1014,6 +1041,34 @@ static bool explain(const std::string &raw, int place) {
                     note("%ss are %s (your call - it'll stick)", det::COCO[k], enemy ? "ENEMIES" : "good / friendly");
                     did = true; break;
                 }
+    }
+    // "wet doesn't matter" / "ignore wet" / "wet is bad" / "radiation is bad"
+    {
+        bool nothing = t.find("doesn t matter") != std::string::npos || t.find("dont matter") != std::string::npos || t.find("don t matter") != std::string::npos ||
+                       t.find("doesnt matter") != std::string::npos || t.find("ignore") != std::string::npos || t.find("means nothing") != std::string::npos ||
+                       t.find("useless") != std::string::npos || t.find("not important") != std::string::npos || t.find("who cares") != std::string::npos ||
+                       t.find("pointless") != std::string::npos;
+        bool isBad = t.find(" is bad") != std::string::npos || t.find(" are bad") != std::string::npos || t.find("lower is better") != std::string::npos;
+        bool isGood = t.find(" is good") != std::string::npos || t.find(" are good") != std::string::npos || t.find("higher is better") != std::string::npos;
+        std::vector<std::string> hit;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            for (auto &st : stats)
+                if (st.label.size() >= 2 && (" " + t + " ").find(" " + st.label) != std::string::npos) {
+                    float w = nothing ? 0.f : isBad ? -2.f : isGood ? 2.f : st.weight;
+                    if (w == st.weight && !nothing && !isBad && !isGood) continue;
+                    st.weight = w; statOverride[st.label] = w;
+                    hit.push_back(st.label);
+                }
+            if (hit.empty() && (nothing || isBad || isGood))
+                for (auto &tk : toks)
+                    if (tk.size() >= 3 && tk != "doesn" && tk != "matter" && tk != "ignore" && tk != "the" && tk != "meter" && tk != "bar" && tk != "bad" && tk != "good") {
+                        statOverride[tk] = nothing ? 0.f : isBad ? -2.f : 2.f;
+                        hit.push_back(tk); break;
+                    }
+        }
+        for (auto &h : hit) note("%s: %s", h.c_str(), nothing ? "doesn't matter - ignoring it" : isBad ? "going up is BAD" : "going up is good");
+        if (!hit.empty()) did = true;
     }
     // "that's my gun" / "airplane is my gun" / "airplanes are guns"
     {
