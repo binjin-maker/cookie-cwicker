@@ -423,6 +423,7 @@ static int userClass[80];
 static std::string classAlias[80];
 static bool hostileClass(int c) { return userClass[c] == -1 || (userClass[c] == 0 && classBad[c] >= 3 && classBad[c] > classGood[c] * 2); }
 static bool friendlyClass(int c) { return userClass[c] == 1 || (userClass[c] == 0 && classGood[c] >= 3 && classGood[c] > classBad[c] * 2); }
+static float sigEnemy = 0, sigResource = 0, sigNeed = 0, sigGood = 0, sigBad = 0;
 static std::string className(int c) { return classAlias[c].empty() ? det::COCO[c] : classAlias[c]; }
 // things that sit in the same spot at the bottom of the screen most of the time (your gun / arms) are yours, not enemies
 static float presence[80][48];
@@ -515,13 +516,24 @@ static float weightFor(const std::string &l, bool &needLike) {
         if (l.find(w) != std::string::npos) return 2;
     return 1;
 }
+struct Used { size_t idx; size_t gen; double t; };
+static std::deque<Used> usedMem;  // remembered moments it copied recently
+static size_t eraseGenR = 0;
+static double lastRewardAt = 0;
 static void reward(float r, int statIdx, bool up, const char *why) {
     double t = now();
     std::lock_guard<std::mutex> lk(mu);
-    for (int i = (int)data.size() - 1; i >= 0 && t - data[i].t < 3.0; i--) {
-        data[i].value += r * (float)std::exp(-(t - data[i].t) / 1.5);
+    if (r != 0) lastRewardAt = t;
+    for (int i = (int)data.size() - 1; i >= 0 && t - data[i].t < 5.0; i--) {
+        data[i].value += r * (float)std::exp(-(t - data[i].t) / 2.5);
         if (statIdx >= 0 && statIdx < 32) { if (up) data[i].up |= 1u << statIdx; else data[i].down |= 1u << statIdx; }
     }
+    // the memories it chose to copy get the credit/blame too, so next time it picks better ones
+    for (auto &u : usedMem)
+        if (u.gen == eraseGenR && u.idx < data.size() && t - u.t < 5.0) {
+            data[u.idx].value += r * 0.8f * (float)std::exp(-(t - u.t) / 2.5);
+            if (statIdx >= 0 && statIdx < 32) { if (up) data[u.idx].up |= 1u << statIdx; else data[u.idx].down |= 1u << statIdx; }
+        }
     if (!data.empty()) {
         int pl = data.back().place;
         if (pl < (int)places.size()) {
@@ -1150,6 +1162,174 @@ void openTell() {
     { std::lock_guard<std::mutex> lk(gPromptMu); gPromptText.clear(); gPromptOpen = true; gPromptLast = now(); }
 }
 
+
+// ---------- taught tasks: you show it something, name it, say when to do it ----------
+struct Step { uint8_t keys[32]; uint8_t btn; int16_t dx, dy; };
+struct Task {
+    std::string name, when;
+    int kind = 0;  // 0 only when asked, 1 stat low, 2 stat high, 3 see a thing, 4 enemy ahead, 5 looking at, 6 every N seconds
+    std::string what; double num = -1;
+    std::vector<Step> steps;
+    double lastRun = -1e9; int runs = 0;
+};
+static std::vector<Task> tasks;
+static int teaching = -1;          // task being recorded
+static double teachStart = 0;
+static int runningTask = -1; static size_t runStep = 0;
+static std::string taskWhy;
+
+static void parseWhen(Task &k) {
+    std::string t = " " + k.when + " ";
+    auto num = [&](size_t from) { for (size_t i = from; i < t.size(); i++) if (isdigit((unsigned char)t[i])) return atof(t.c_str() + i); return -1.0; };
+    size_t p;
+    if ((p = t.find(" every ")) != std::string::npos) {
+        double n = num(p); if (n <= 0) n = 1;
+        if (t.find("min") != std::string::npos) n *= 60;
+        k.kind = 6; k.num = n; return;
+    }
+    if (t.find("enem") != std::string::npos || t.find("attacked") != std::string::npos || t.find("getting shot") != std::string::npos) { k.kind = 4; return; }
+    for (const char *ph : {" looking at ", " facing ", " in front of "})
+        if ((p = t.find(ph)) != std::string::npos) {
+            k.kind = 5; k.what = t.substr(p + strlen(ph));
+            for (const char *dropw : {"a ", "an ", "the "}) if (k.what.rfind(dropw, 0) == 0) k.what = k.what.substr(strlen(dropw));
+            while (!k.what.empty() && k.what.back() == ' ') k.what.pop_back();
+            return;
+        }
+    for (const char *ph : {" see ", " there is ", " there s ", " spot "})
+        if ((p = t.find(ph)) != std::string::npos) {
+            for (int c = 0; c < 80; c++) {
+                std::string n = className(c), n2 = det::COCO[c];
+                if (t.find(" " + n, p) != std::string::npos || t.find(" " + n2, p) != std::string::npos) { k.kind = 3; k.num = c; k.what = n; return; }
+            }
+        }
+    bool low = t.find(" low") != std::string::npos || t.find(" below") != std::string::npos || t.find(" under") != std::string::npos ||
+               t.find(" drops") != std::string::npos || t.find(" less than") != std::string::npos || t.find(" empty") != std::string::npos ||
+               t.find(" hungry") != std::string::npos || t.find(" thirsty") != std::string::npos || t.find(" hurt") != std::string::npos;
+    bool high = t.find(" high") != std::string::npos || t.find(" above") != std::string::npos || t.find(" over ") != std::string::npos ||
+                t.find(" full") != std::string::npos || t.find(" more than") != std::string::npos;
+    if (low || high) {
+        k.kind = low ? 1 : 2; k.num = num(0);
+        static const char *skipw[] = {"when", "my", "is", "the", "gets", "get", "low", "below", "under", "drops", "high", "above", "over", "full", "less", "more",
+                                      "than", "empty", "it", "i", "m", "am", "you", "are", "bar", "meter"};
+        auto toks = split(t);
+        for (auto &w : toks) {
+            bool sk = isdigit((unsigned char)w[0]);
+            for (auto s2 : skipw) if (w == s2) sk = true;
+            if (!sk) { k.what = w; break; }
+        }
+        if (k.what == "hungry") k.what = "food";
+        if (k.what == "thirsty") k.what = "water";
+        if (k.what == "hurt") k.what = "health";
+        return;
+    }
+    k.kind = 0;
+}
+static bool taskDue(Task &k, std::string &why) {
+    double t = now();
+    if (k.steps.empty()) return false;
+    if (k.kind == 6) { if (t - k.lastRun > k.num) { why = "it's been " + std::to_string((int)k.num) + " s"; return true; } return false; }
+    if (t - k.lastRun < 10) return false;
+    if (k.kind == 1 || k.kind == 2) {
+        for (auto &st : stats) {
+            if (st.seen < 2 || st.label.find(k.what) == std::string::npos) continue;
+            double th = k.num >= 0 ? k.num : st.maxSeen * (k.kind == 1 ? 0.4 : 0.9);
+            if (k.kind == 1 ? st.last < th : st.last > th) { why = st.label + " is " + fmtNum(st.last); return true; }
+        }
+        return false;
+    }
+    if (k.kind == 3 && k.num >= 0 && t - classSeen[(int)k.num] < 0.5) { why = "saw a " + k.what; return true; }
+    if (k.kind == 4 && sigEnemy > 0.5f) { why = "enemy ahead"; return true; }
+    if (k.kind == 5 && lookingAt >= 0 && looks[lookingAt].label.find(k.what) != std::string::npos) { why = "looking at " + looks[lookingAt].label; return true; }
+    return false;
+}
+static void saveTasks() {
+    CreateDirectoryA("copycat", nullptr);
+    std::string p = "copycat\\" + name + ".tasks";
+    if (FILE *f = fopen(p.c_str(), "wb")) {
+        uint32_t n = (uint32_t)tasks.size(); fwrite(&n, 4, 1, f);
+        for (auto &k : tasks) {
+            uint32_t L = (uint32_t)k.name.size(); fwrite(&L, 4, 1, f); fwrite(k.name.data(), 1, L, f);
+            L = (uint32_t)k.when.size(); fwrite(&L, 4, 1, f); fwrite(k.when.data(), 1, L, f);
+            uint32_t S = (uint32_t)k.steps.size(); fwrite(&S, 4, 1, f); if (S) fwrite(k.steps.data(), sizeof(Step), S, f);
+            fwrite(&k.runs, 4, 1, f);
+        }
+        fclose(f);
+    }
+}
+static void loadTasks() {
+    tasks.clear();
+    std::string p = "copycat\\" + name + ".tasks";
+    FILE *f = fopen(p.c_str(), "rb");
+    if (!f) return;
+    uint32_t n = 0;
+    if (fread(&n, 4, 1, f) == 1 && n < 500)
+        for (uint32_t i = 0; i < n; i++) {
+            Task k; uint32_t L = 0, S = 0;
+            if (fread(&L, 4, 1, f) != 1 || L > 200) break; k.name.resize(L); if (L && fread(&k.name[0], 1, L, f) != L) break;
+            if (fread(&L, 4, 1, f) != 1 || L > 400) break; k.when.resize(L); if (L && fread(&k.when[0], 1, L, f) != L) break;
+            if (fread(&S, 4, 1, f) != 1 || S > 30 * 120) break; k.steps.resize(S); if (S && fread(k.steps.data(), sizeof(Step), S, f) != S) break;
+            if (fread(&k.runs, 4, 1, f) != 1) break;
+            parseWhen(k);
+            tasks.push_back(k);
+        }
+    fclose(f);
+}
+// "teach heal when health is low", "learn: reload when ammo is empty", "this is how to loot when looking at a crate", "done", "do heal"
+static bool taskCommand(const std::string &raw) {
+    std::string t = lower(raw);
+    for (auto &c : t) if (!isalnum((unsigned char)c) && c != ' ') c = ' ';
+    std::string tt = " " + t + " ";
+    if (teaching >= 0 && (tt.find(" done ") != std::string::npos || tt.find(" finished ") != std::string::npos || tt.find(" end ") != std::string::npos ||
+                          tt.find(" stop ") != std::string::npos || tt.find(" that s it ") != std::string::npos || tt.find(" thats it ") != std::string::npos)) {
+        Task &k = tasks[teaching];
+        // trim idle frames at the start and end
+        auto idleStep = [](const Step &s) { if (s.btn || std::abs(s.dx) + std::abs(s.dy) > 2) return false; for (int i = 0; i < 32; i++) if (s.keys[i]) return false; return true; };
+        while (!k.steps.empty() && idleStep(k.steps.back())) k.steps.pop_back();
+        size_t lead = 0; while (lead < k.steps.size() && idleStep(k.steps[lead])) lead++;
+        k.steps.erase(k.steps.begin(), k.steps.begin() + lead);
+        note("learned task \"%s\" (%.1f s of actions) - it'll do it %s", k.name.c_str(), k.steps.size() / 30.0, k.kind ? ("when " + k.when).c_str() : "when you say \"do " + k.name + "\"");
+        if (k.steps.empty()) { note("...but you didn't press anything, so it's empty - teach it again"); tasks.erase(tasks.begin() + teaching); }
+        teaching = -1; showUntil = 0;
+        saveTasks();
+        return true;
+    }
+    size_t p = std::string::npos; size_t len = 0;
+    for (const char *ph : {" teach ", " learn ", " this is how to ", " this is how you ", " watch me ", " task "})
+        if ((p = tt.find(ph)) != std::string::npos) { len = strlen(ph); break; }
+    if (p != std::string::npos) {
+        std::string rest = tt.substr(p + len);
+        Task k;
+        size_t w = rest.find(" when ");
+        if (w == std::string::npos) w = rest.find(" every ");
+        if (w == std::string::npos) w = rest.find(" if ");
+        k.name = rest.substr(0, w == std::string::npos ? rest.size() : w);
+        if (w != std::string::npos) k.when = rest.substr(w + 1);
+        while (!k.name.empty() && k.name.front() == ' ') k.name.erase(0, 1);
+        while (!k.name.empty() && k.name.back() == ' ') k.name.pop_back();
+        while (!k.when.empty() && k.when.back() == ' ') k.when.pop_back();
+        if (k.name.empty()) k.name = "task " + std::to_string(tasks.size() + 1);
+        parseWhen(k);
+        for (size_t i = 0; i < tasks.size(); i++) if (tasks[i].name == k.name) { tasks.erase(tasks.begin() + i); break; }
+        tasks.push_back(k);
+        teaching = (int)tasks.size() - 1; teachStart = now();
+        showUntil = now() + 3600;
+        note("TEACHING \"%s\" - do it now, then F10 \"done\"%s", k.name.c_str(), k.kind ? "" : " (no 'when' - it'll only do it when asked)");
+        return true;
+    }
+    for (const char *ph : {" do ", " run ", " go "})
+        if ((p = tt.find(ph)) != std::string::npos) {
+            std::string nm = tt.substr(p + strlen(ph));
+            while (!nm.empty() && nm.back() == ' ') nm.pop_back();
+            for (size_t i = 0; i < tasks.size(); i++)
+                if (!tasks[i].name.empty() && (nm.find(tasks[i].name) != std::string::npos || tasks[i].name.find(nm) == 0)) {
+                    runningTask = (int)i; runStep = 0; taskWhy = "you asked";
+                    note("doing task \"%s\"", tasks[i].name.c_str());
+                    return true;
+                }
+        }
+    return false;
+}
+
 static void openAsk() {
     for (auto &b : keyBits) b = 0;
     telling = false;
@@ -1165,7 +1345,7 @@ static int wantTool = -1;
 // live "brain" signals (0..1) for the neuron view
 std::mutex bmu;
 float bIn[8], bMem[6], bDrv[8], bOut[12];
-static float sigEnemy = 0, sigResource = 0, sigNeed = 0, sigGood = 0, sigBad = 0;
+
 static long decide(const uint8_t *f, const uint8_t *th) {
     double t0 = now();
     struct Hit { int d; size_t i; };
@@ -1184,7 +1364,7 @@ static long decide(const uint8_t *f, const uint8_t *th) {
         std::vector<Hit> rough;
         for (size_t i = 0; i + 1 < data.size(); i++) {
             const Frame &fr = data[i];
-            if (fr.self && fr.value < 0.5) continue;  // only follow my own moves if they paid off
+            if (fr.self == 1 && fr.value < 0.5) continue;  // only follow my own moves if they paid off
             if (data[i + 1].t - fr.t > 0.2) continue;  // needs a continuation to follow
             int d = distThumb(th, fr.thumb);
             if (rough.size() < 400) { rough.push_back({d, i}); std::push_heap(rough.begin(), rough.end(), cmp); }
@@ -1221,13 +1401,22 @@ static long decide(const uint8_t *f, const uint8_t *th) {
         double best = -1, val = 0, W = 0;
         for (auto &h : top) {
             const Frame &fr = data[h.i];
-            double w = std::exp(-(h.d - dmin) / (dRef * 0.5 + 1)) * std::max(0.1, std::min(3.0, 1.0 + fr.value));
+            double w = std::exp(-(h.d - dmin) / (dRef * 0.5 + 1)) * std::max(0.03, std::min(6.0, std::exp(0.9 * fr.value)));
+            if (fr.self == 2) w *= 2;  // you corrected it here - trust that a lot
             if (needMask && (fr.up & needMask)) w *= 3;
             if (needMask && (fr.down & needMask)) w *= 0.4;
             if (enemyNear && (fr.btn & 1)) w *= 2.5;
             if (resourceAhead && (fr.btn & 1)) w *= 3;
             W += w; val += w * fr.value;
             if (w > best) { best = w; pick = (long)h.i; }
+        }
+        // bored (nothing good or bad for a while): sometimes try the 2nd/3rd best memory instead
+        if (now() - lastRewardAt > 25 && top.size() > 2 && rand() % 3 == 0) {
+            std::vector<std::pair<double, size_t>> ws;
+            for (auto &h : top) ws.push_back({std::exp(-(h.d - dmin) / (dRef * 0.5 + 1)), h.i});
+            std::sort(ws.rbegin(), ws.rend());
+            pick = (long)ws[1 + rand() % std::min<size_t>(2, ws.size() - 1)].second;
+            { std::lock_guard<std::mutex> l3(amu); goal = "nothing's happening - trying something different"; }
         }
         {
             std::vector<double> ws;
@@ -1307,6 +1496,14 @@ static void loop() {
         }
         memcpy(prev, f, FD); havePrev = true;
 
+        {
+            static double stuckSince = 0;
+            bool moving = hasKey(heldOut, 'W') || hasKey(heldOut, 'A') || hasKey(heldOut, 'S') || hasKey(heldOut, 'D');
+            if (mode == 2 && !takeover && moving && change < 1.5) {
+                if (stuckSince == 0) stuckSince = now();
+                if (now() - stuckSince > 3) { reward(-0.7f, -1, false, "stuck - walking but going nowhere"); stuckSince = now(); }
+            } else stuckSince = 0;
+        }
         int m = mode;
         stepLoop = "mode";
         if (m == 3) {
@@ -1315,6 +1512,13 @@ static void loop() {
             if (!a.empty()) {
                 int pl = -1;
                 { std::lock_guard<std::mutex> lk(mu); if (!data.empty()) pl = data.back().place; }
+                if (taskCommand(a)) {
+                    confusedSince = 0;
+                    mode = telling ? (int)resumeMode : 2;
+                    telling = false;
+                    for (auto &b : keyBits) b = 0;
+                    continue;
+                }
                 bool understood = explain(a, pl);
                 Plan pp = parseAnswer(a);
                 bool act = pp.show || !pp.keys.empty() || pp.btn || pp.mdx != 0 || (!understood && !telling);
@@ -1333,7 +1537,7 @@ static void loop() {
             continue;
         }
         bool watching = m == 1 || (m == 2 && (now() - physAt < 2.0 || now() < showUntil));
-        if (m == 2 && watching && !takeover) { takeover = true; releaseAll(); note("you took over - watching you"); }
+        if (m == 2 && watching && !takeover) { takeover = true; releaseAll(); if (runningTask >= 0) { tasks[runningTask].lastRun = now(); runningTask = -1; } if (teaching < 0) note("you took over - watching you"); }
         if (m == 2 && !watching && takeover) { takeover = false; note("back to playing on my own"); }
 
         Frame fr{}; memcpy(fr.f, f, FD); memcpy(fr.thumb, th, TN); fr.t = now();
@@ -1341,7 +1545,12 @@ static void loop() {
         if (watching) {
             for (int i = 0; i < 4; i++) { uint64_t b = keyBits[i]; memcpy(fr.keys + i * 8, &b, 8); }
             fr.btn = (uint8_t)btnState; fr.dx = (int16_t)std::max(-3000, std::min(3000, dxr)); fr.dy = (int16_t)std::max(-3000, std::min(3000, dyr));
-            fr.self = 0;
+            fr.self = (m == 2 && takeover) ? 2 : 0;
+            if (teaching >= 0 && teaching < (int)tasks.size()) {
+                Step st; memcpy(st.keys, fr.keys, 32); st.btn = fr.btn; st.dx = fr.dx; st.dy = fr.dy;
+                tasks[teaching].steps.push_back(st);
+                if (now() - teachStart > 120) { note("teaching ran 2 minutes - stopping it there"); taskCommand("done"); }
+            }
             // you pressed a number key -> remember what the hotbar looks like with that slot picked
             static uint8_t lastKeys[32]; static int pendTool = 0; static double pendAt = 0;
             for (int d = 1; d <= 9; d++) if (hasKey(fr.keys, '0' + d) && !hasKey(lastKeys, '0' + d)) { pendTool = d; pendAt = now() + 0.35; }
@@ -1367,7 +1576,20 @@ static void loop() {
                 mode = 0; break;
             }
             bool planOn = now() < plan.until && !plan.show;
-            if (planOn) {
+            if (runningTask < 0 && !planOn)
+                for (size_t i = 0; i < tasks.size(); i++) { std::string why; if (taskDue(tasks[i], why)) { runningTask = (int)i; runStep = 0; taskWhy = why; note("doing task \"%s\" (%s)", tasks[i].name.c_str(), why.c_str()); break; } }
+            if (runningTask >= 0 && runningTask < (int)tasks.size()) {
+                Task &k = tasks[runningTask];
+                if (runStep < k.steps.size()) {
+                    const Step &st = k.steps[runStep++];
+                    memcpy(ko, st.keys, 32); b = st.btn; mx = std::max(-80, std::min(80, (int)st.dx)); my = std::max(-80, std::min(80, (int)st.dy));
+                    std::lock_guard<std::mutex> lk(amu);
+                    goal = "task \"" + k.name + "\" (" + taskWhy + ")"; actionTxt = "step " + std::to_string(runStep) + " / " + std::to_string(k.steps.size());
+                    planOn = true;
+                } else { k.lastRun = now(); k.runs++; runningTask = -1; }
+            }
+            if (planOn && runningTask >= 0) {
+            } else if (planOn) {
                 memset(ko, 0, 32);
                 for (WORD vk : plan.keys) ko[vk >> 3] |= 1 << (vk & 7);
                 b = plan.btn; mx = (int)plan.mdx; my = 0;
@@ -1386,12 +1608,14 @@ static void loop() {
                     std::lock_guard<std::mutex> lk(mu);
                     if (clipIdx < (long)data.size()) {
                         const Frame &src = data[clipIdx];
+                        usedMem.push_back({(size_t)clipIdx, eraseGenR, now()});
+                        while (usedMem.size() > 200 || (!usedMem.empty() && now() - usedMem.front().t > 6)) usedMem.pop_front();
                         memcpy(ko, src.keys, 32); b = src.btn;
                         mx = std::max(-80, std::min(80, (int)src.dx)); my = std::max(-80, std::min(80, (int)src.dy));
                         for (int vk = 1; vk < 256; vk++) if (hasKey(ko, vk)) act += keyName(vk) + " ";
                         if (b & 1) act += "LMB "; if (b & 2) act += "RMB ";
                         long nx = clipIdx + 1;
-                        if (nx < (long)data.size() && data[nx].t - src.t < 0.2 && data[nx].self == src.self) { clipIdx = nx; clipLeft--; }
+                        if (nx < (long)data.size() && data[nx].t - src.t < 0.2 && (data[nx].self == 1) == (src.self == 1)) { clipIdx = nx; clipLeft--; }
                         else clipLeft = 0;
                     }
                 }
@@ -1437,11 +1661,11 @@ static void loop() {
             fr.place = (uint16_t)std::max(0, placeFor(f));
             stepLoop = "key stats";
             data.push_back(fr);
-            if (fr.self) selfN++; else demoN++;
+            if (fr.self == 1) selfN++; else demoN++;
             if (data.size() > MAXFRAMES) {
-                auto it = std::find_if(data.begin(), data.end(), [](const Frame &x) { return x.self; });
+                auto it = std::find_if(data.begin(), data.end(), [](const Frame &x) { return x.self == 1; });
                 data.erase(it != data.end() ? it : data.begin());
-                eraseGen++;
+                eraseGen++; eraseGenR++; usedMem.clear();
             }
             if (watching) {
                 int held = 0;
@@ -1516,6 +1740,8 @@ void stop() {
     analyze();
     fileSave();
     { std::lock_guard<std::mutex> lk(mu); saveRules(); }
+    if (teaching >= 0) taskCommand("done");
+    saveTasks();
     std::vector<std::string> fs;
     { std::lock_guard<std::mutex> lk(amu); fs = findings; }
     note("stopped %s - %d frames of you, %d of me, %d places, %d things noted", was == 1 ? "watching" : "copying", demoN, selfN, (int)places.size(), (int)fs.size());
@@ -1535,9 +1761,10 @@ void start(int m) {
         std::lock_guard<std::mutex> lk(mu);
         stats.clear(); stats.reserve(MAXSTAT); keyStats.clear(); idle = KeyStat{};
     }
-    { std::lock_guard<std::mutex> lk(mu); demoN = 0; selfN = 0; for (auto &d : data) (d.self ? selfN : demoN)++; }
+    { std::lock_guard<std::mutex> lk(mu); demoN = 0; selfN = 0; for (auto &d : data) (d.self == 1 ? selfN : demoN)++; }
     computeRef();
-    { std::lock_guard<std::mutex> lk(mu); loadRules(); }
+    { std::lock_guard<std::mutex> lk(mu); loadRules(); loadTasks(); }
+    teaching = -1; runningTask = -1;
     memset(heldOut, 0, sizeof heldOut); btnOut = 0;
     for (auto &b : keyBits) b = 0;
     rawDx = 0; rawDy = 0; takeover = false; plan = Plan{}; showUntil = 0; confusedSince = 0;

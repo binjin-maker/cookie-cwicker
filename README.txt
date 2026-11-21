@@ -661,6 +661,31 @@ CONTENTS
   by name. When it needs wood and is looking at a "gives wood" thing,
   it hits it.
 
+  Tasks (you teach it a move, it does it when it should):
+    F10 "teach heal when health is low"   -> then just do it (press the
+        keys, click, whatever), then F10 "done". It records exactly what
+        you did and replays it whenever the condition is true.
+    Conditions it understands:
+        "when <number> is low / below 30 / empty"   (health, food, water,
+           ammo... any number it reads on screen; "hungry", "thirsty",
+           "hurt" work too)
+        "when <number> is high / above 80 / full"
+        "when you see a bear" (anything the detector knows, or a name
+           you gave it)
+        "when an enemy is ahead"
+        "when looking at a crate" (something it learned to recognise)
+        "every 2 minutes" / "every 30 seconds"
+        no "when" -> only when you ask: F10 "do heal"
+    Teaching the same name again replaces it. Saved in
+    copycat\<game>.tasks. Grabbing the mouse cancels a running task.
+
+  Learning speed: when something good or bad happens, the credit goes
+  back 5 s, AND to the remembered moments it was copying, so it stops
+  picking memories that led somewhere bad. Moments where you took over
+  and corrected it count double. If nothing happens for 25 s it gets
+  "bored" and tries its 2nd/3rd best idea; walking into a wall for 3 s
+  counts as bad.
+
   Moving things: each frame it removes the camera's own motion and
   finds what is still moving (players, NPCs, animals, vehicles),
   with colour and shape (tall = person-like, wide = animal/vehicle-
