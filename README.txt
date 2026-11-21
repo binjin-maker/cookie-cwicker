@@ -672,6 +672,17 @@ CONTENTS
   The answer is remembered with that screen; next time it sees
   something similar it just does it without asking.
 
+  Brain view (lower right): a live neural-network picture. Four
+  columns of neurons - SEES (motion, enemy, objects, movers, what's
+  in the crosshair, tool, need, you driving), MEMORIES (how strongly
+  its 6 closest remembered moments match), WANTS (fight, gather,
+  survive, go for good, be careful, your order, confused, copy you)
+  and DOES (W A S D jump sprint crouch use shoot aim turn). Each
+  neuron's glow is a real signal from the bot; links light up and
+  carry pulses where both ends are active. In cookie mode it shows
+  the cookie version (count, bonus, puzzle -> store options -> buy /
+  save / click -> click, buy, scroll, read). Off with Effects+HUD.
+
   Analysis HUD (lower left while the game is in front): mode, speed
   (fps, decide ms, number-reading ms), what numbers it's watching,
   which place it's in, what it has worked out about each key/mouse

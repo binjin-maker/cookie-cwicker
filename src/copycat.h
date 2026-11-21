@@ -968,6 +968,10 @@ static void openAsk() {
 }
 
 static int wantTool = -1;
+// live "brain" signals (0..1) for the neuron view
+std::mutex bmu;
+float bIn[8], bMem[6], bDrv[8], bOut[12];
+static float sigEnemy = 0, sigResource = 0, sigNeed = 0, sigGood = 0, sigBad = 0;
 static long decide(const uint8_t *f) {
     double t0 = now();
     struct Hit { int d; size_t i; };
@@ -1023,6 +1027,15 @@ static long decide(const uint8_t *f) {
             W += w; val += w * fr.value;
             if (w > best) { best = w; pick = (long)h.i; }
         }
+        {
+            std::vector<double> ws;
+            for (auto &h : top) ws.push_back(std::exp(-(h.d - dmin) / (dRef * 0.5 + 1)));
+            std::sort(ws.rbegin(), ws.rend());
+            std::lock_guard<std::mutex> bl(bmu);
+            for (int i = 0; i < 6; i++) bMem[i] = i < (int)ws.size() ? (float)ws[i] : 0;
+        }
+        sigEnemy = enemyNear ? 1.f : 0.f; sigResource = resourceAhead ? 1.f : 0.f; sigNeed = needIdx.empty() ? 0.f : 1.f;
+        sigGood = W > 0 ? (float)std::max(0.0, std::min(1.0, val / W)) : 0; sigBad = W > 0 ? (float)std::max(0.0, std::min(1.0, -val / W)) : 0;
         std::string g;
         if (!needIdx.empty()) {
             const Stat &st = stats[needIdx[0]];
@@ -1200,6 +1213,16 @@ static void loop() {
                 note("switching to %s", toolName(wantTool).c_str());
             }
             if (switchFrames > 0) { switchFrames--; ko[switchKey >> 3] |= 1 << (switchKey & 7); }
+            {
+                std::lock_guard<std::mutex> bl(bmu);
+                const int ok[8] = {'W', 'A', 'S', 'D', VK_SPACE, VK_SHIFT, VK_CONTROL, 'E'};
+                for (int i = 0; i < 8; i++) bOut[i] = bOut[i] * 0.6f + (hasKey(ko, ok[i]) ? 0.4f : 0.f);
+                bOut[8] = bOut[8] * 0.6f + ((b & 1) ? 0.4f : 0.f); bOut[9] = bOut[9] * 0.6f + ((b & 2) ? 0.4f : 0.f);
+                bOut[10] = bOut[10] * 0.6f + (mx < -2 ? 0.4f : 0.f); bOut[11] = bOut[11] * 0.6f + (mx > 2 ? 0.4f : 0.f);
+                bDrv[0] = sigEnemy; bDrv[1] = std::max(sigResource, wantTool > 0 ? 0.6f : 0.f); bDrv[2] = sigNeed;
+                bDrv[3] = sigGood; bDrv[4] = sigBad; bDrv[5] = planOn ? 1.f : 0.f;
+                bDrv[6] = (float)std::min(1.0, confusion / 3.0); bDrv[7] = std::max(0.f, 1.f - bDrv[6] - bDrv[0] * 0.5f);
+            }
             stepLoop = "press keys";
             applyOut(ko, b);
             sendMove(mx, my);
@@ -1251,6 +1274,27 @@ static void loop() {
             }
             moverTxt = mv.empty() ? "nothing moving" : mv;
             if (watching) { actionTxt = "recording you"; if (m == 1) goal = "learning what you do"; }
+            {
+                std::lock_guard<std::mutex> bl(bmu);
+                int nDet = 0; { std::lock_guard<std::mutex> dl(det::mu); if (now() - det::boxesAt < 0.6) nDet = (int)det::boxes.size(); }
+                float numFlash = 0;
+                bIn[0] = (float)std::min(1.0, change / 25.0);
+                bIn[1] = std::max(sigEnemy, 0.f);
+                bIn[2] = std::min(1.f, nDet / 4.f);
+                bIn[3] = std::min(1.f, movers.size() / 4.f);
+                bIn[4] = lookingAt >= 0 ? 1.f : 0.f;
+                bIn[5] = curTool > 0 ? 1.f : 0.f;
+                bIn[6] = sigNeed; (void)numFlash;
+                bIn[7] = watching ? 1.f : 0.f;
+                if (watching) {
+                    const int ok[8] = {'W', 'A', 'S', 'D', VK_SPACE, VK_SHIFT, VK_CONTROL, 'E'};
+                    for (int i = 0; i < 8; i++) bOut[i] = bOut[i] * 0.6f + (hasKey(fr.keys, ok[i]) ? 0.4f : 0.f);
+                    bOut[8] = bOut[8] * 0.6f + ((fr.btn & 1) ? 0.4f : 0.f); bOut[9] = bOut[9] * 0.6f + ((fr.btn & 2) ? 0.4f : 0.f);
+                    bOut[10] = bOut[10] * 0.6f + (fr.dx < -2 ? 0.4f : 0.f); bOut[11] = bOut[11] * 0.6f + (fr.dx > 2 ? 0.4f : 0.f);
+                    for (int i = 0; i < 6; i++) bMem[i] *= 0.9f;
+                    bDrv[7] = 1.f; for (int i = 0; i < 7; i++) bDrv[i] *= 0.9f;
+                }
+            }
         }
         if (now() - lastAnalyze > 2) { stepLoop = "analyze"; analyze(); lastAnalyze = now(); }
         if (now() - lastSave > 120) { stepLoop = "save"; fileSave(); lastSave = now(); }

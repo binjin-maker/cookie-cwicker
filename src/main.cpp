@@ -33,7 +33,7 @@ using namespace ABI::Windows::Storage::Streams;
 static double cfgCps = 12.0, cfgHours = 8.0;
 static bool cfgGolden = true, cfgBuy = true, cfgFx = true;
 static const char *BRAIN = "cookiebot_brain.txt";
-static const int VERSION = 20;
+static const int VERSION = 21;
 static const char *REPO_RAW = "https://raw.githubusercontent.com/binjin-maker/cookie-cwicker/main/";
 
 // ---------- state ----------
@@ -1779,6 +1779,7 @@ static void renderHud() {
 
 #include "detect.h"
 #include "copycat.h"
+#include "brain.h"
 
 // ================= control panel window =================
 enum { ID_PAUSE = 101, ID_QUIT, ID_BUY, ID_GOLD, ID_FX, ID_HOURS, ID_CPS, ID_APPLY, ID_FORGET, ID_LOG, ID_STATUS, ID_STATS, ID_UPDATE, ID_WATCH, ID_COPY };
@@ -2220,6 +2221,7 @@ int main(int argc, char **argv) {
     logf("CookieBot v%d - brain has %d purchases and %d upgrade types learned", VERSION, gBrain.purchases, (int)gBrain.corr.size());
     if (!ocrInit()) { MessageBoxW(nullptr, L"Windows OCR isn't available. Check cookiebot_log.txt.", L"CookieBot", MB_ICONERROR); return 1; }
     cc::init();
+    std::thread(brain::thread).detach();
     setState("WAITING"); setTask("Click on the game's browser tab to start");
     logf("Click on the browser tab with the game to start.");
     while (!gQuit) {
